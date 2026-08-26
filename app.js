@@ -280,7 +280,7 @@ async function employeeSyncPlatform() {
 }
 
 /**
- * المهندس في الرياضيات v2.0 - Core Intelligence Engine
+ * مركز بداية التعليم v2.0 - Core Intelligence Engine
  */
 
 // --- Database & Persistence ---
@@ -7598,7 +7598,7 @@ function _printDailyTreasuryCurrentGroup() {
         <body>
             <div class="header">
                 <h1>💰 كشف تحصيل اليوم</h1>
-                <p>${profile.centerName || ''} — أ/ ${profile.teacherName || 'المهندس في الرياضيات'}</p>
+                <p>${profile.centerName || ''} — أ/ ${profile.teacherName || 'مركز بداية التعليم'}</p>
                 <p>${todayStrAr}</p>
                 <p>${gradeObj ? gradeObj.name : ''}${groupObj ? ' — ' + groupObj.name : ''}</p>
             </div>
@@ -7773,7 +7773,7 @@ function _printDailyTreasuryAllGroups() {
         <body>
             <div class="main-header">
                 <h1>🖨️ كشف تحصيل جميع المجموعات</h1>
-                <p>${profile.centerName || ''} — أ/ ${profile.teacherName || 'المهندس في الرياضيات'}</p>
+                <p>${profile.centerName || ''} — أ/ ${profile.teacherName || 'مركز بداية التعليم'}</p>
                 <p>${todayStrAr}</p>
             </div>
             <div class="grand-summary">
@@ -7858,7 +7858,7 @@ function printDailyTreasuryReport() {
         <body>
             <div class="header">
                 <h1>تقرير تحصيل الخزنة اليومي</h1>
-                <p>${treasuryReportProfile.centerName || ''} - أ/ ${treasuryReportProfile.teacherName || 'المهندس في الرياضيات'}</p>
+                <p>${treasuryReportProfile.centerName || ''} - أ/ ${treasuryReportProfile.teacherName || 'مركز بداية التعليم'}</p>
                 <p style="font-weight: 700;">${todayStrAr}</p>
             </div>
             
@@ -9680,7 +9680,7 @@ function renderMonthlyReportBody() {
     const gradeObj = (typeof gradesList !== 'undefined') ? gradesList.find(g => String(g.id) === String(s.grade)) : null;
 
     // ── Header info ──
-    document.getElementById('report-teacher-name').innerText = `المدرس: أ/ ${profile.teacherName || 'المهندس في الرياضيات'}`;
+    document.getElementById('report-teacher-name').innerText = `المدرس: أ/ ${profile.teacherName || 'مركز بداية التعليم'}`;
     document.getElementById('report-date-range').innerText = `للفترة: ${period.label}`;
     document.getElementById('rep-st-name').innerText = s.name;
     document.getElementById('rep-st-code').innerText = s.qrCode || '---';
@@ -10638,22 +10638,22 @@ function initExperienceEnhancements() {
 function getProgramProfile() {
     if (!db._settings.appProfile) {
         db._settings.appProfile = {
-            centerName: 'المهندس في الرياضيات',
-            teacherName: 'المهندس في الرياضيات',
-            stickerTitle: 'المهندس في الرياضيات',
+            centerName: 'مركز بداية التعليم',
+            teacherName: 'مركز بداية التعليم',
+            stickerTitle: 'مركز بداية التعليم',
             phone: ''
         };
     }
     // ضمان وجود centerName الافتراضي لو كان فارغًا
     if (!db._settings.appProfile.centerName) {
-        db._settings.appProfile.centerName = 'المهندس في الرياضيات';
+        db._settings.appProfile.centerName = 'مركز بداية التعليم';
     }
     return db._settings.appProfile;
 }
 
 function applyProgramProfile() {
     const profile = getProgramProfile();
-    const centerDisplay = profile.centerName || 'المهندس في الرياضيات';
+    const centerDisplay = profile.centerName || 'مركز بداية التعليم';
     document.title = `${centerDisplay} | نظام الإدارة`;
 
     // شعار الشريط الجانبي
@@ -12926,7 +12926,7 @@ const exposures = {
         snapshot.gradesList = gradesList;
 
         const dataJsContent = `/**
- * المهندس في الرياضيات Data Storage File - للبيع والنقل
+ * مركز بداية التعليم Data Storage File - للبيع والنقل
  * Created: ${new Date().toLocaleString()}
  */
 window.edu_initial_data = ${JSON.stringify(snapshot, null, 4)};`;
@@ -14011,7 +14011,7 @@ function printAttendanceSheets() {
     <body>
         <div class="sheet-header">
             <h1>كشوف حضور وغياب الطلاب</h1>
-            <p>${attSheetProfile.centerName || ''} - أ/ ${attSheetProfile.teacherName || 'المهندس في الرياضيات'}</p>
+            <p>${attSheetProfile.centerName || ''} - أ/ ${attSheetProfile.teacherName || 'مركز بداية التعليم'}</p>
             <p>السنة الدراسية: ${gradeName} | تاريخ الطباعة: ${new Date().toLocaleDateString('ar-EG')}</p>
         </div>
     `;
@@ -14100,7 +14100,7 @@ function printStudentsData() {
     <body onload="window.print()">
         <div class="header">
             <h1>سجل بيانات الطلاب التفصيلي</h1>
-            <p>${dataSheetProfile.centerName || ''} - أ/ ${dataSheetProfile.teacherName || 'المهندس في الرياضيات'}</p>
+            <p>${dataSheetProfile.centerName || ''} - أ/ ${dataSheetProfile.teacherName || 'مركز بداية التعليم'}</p>
             <p>المرحلة: ${gradeBadge} | إجمالي الطلاب: ${students.length}</p>
         </div>
         <table>
