@@ -1,238 +1,255 @@
 // ============================================================
-//  halls.js  —  نظام إدارة القاعات الدراسية
-//  Classroom Halls Management System
-//
-//  الميزات:
-//    • إضافة / تعديل / حذف قاعات غير محدودة
-//    • جدولة حجوزات داخل كل قاعة (يوم + وقت + صف + مجموعة)
-//    • كشف التعارض الذكي داخل نفس القاعة
-//    • جدول أسبوعي مرئي لكل قاعة
-//    • تكامل كامل مع gradesList و db.groups الموجودَين
-//
-//  التخزين: IndexedDB (StorageEngine) — جدولان:
-//    halls     : { id, name, color, createdAt }
-//    hallBookings: { id, hallId, day, timeFrom, timeTo,
-//                    grade, groupId, notes, createdAt }
+//  halls.js  —  نظام إدارة القاعات + الجدول المركزي للحصص
+//  v2.0 — مُدمَج مع حسابات المدرسين وكشف التعارض الكامل
 // ============================================================
 
 (function () {
   'use strict';
 
-  /* ══════════════════════════════════════════════════════════
-     ثوابت
-  ══════════════════════════════════════════════════════════ */
   const ARABIC_DAYS = ['الأحد', 'الاثنين', 'الثلاثاء', 'الأربعاء', 'الخميس', 'الجمعة', 'السبت'];
   const DAY_KEYS    = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
   const HALL_COLORS = [
-    '#4f46e5', '#0ea5e9', '#10b981', '#f59e0b',
-    '#ef4444', '#8b5cf6', '#ec4899', '#14b8a6'
+    '#4f46e5','#0ea5e9','#10b981','#f59e0b',
+    '#ef4444','#8b5cf6','#ec4899','#14b8a6'
   ];
 
-  /* ══════════════════════════════════════════════════════════
-     حالة الوحدة
-  ══════════════════════════════════════════════════════════ */
-  let halls      = [];   // كل القاعات
-  let bookings   = [];   // كل الحجوزات
-  let activeHallId = null;    // القاعة المفتوحة حالياً
-  let editingBookingId = null; // حجز قيد التعديل
-  let editingHallId    = null; // قاعة قيد التعديل
+  // ── State ──
+  let halls    = [];
+  let lessons  = [];   // الجدول المركزي (بديل hallBookings)
+  let teachers = [];
+  let activeHallId = null;
+  let editingHallId = null;
+  let editingLessonId = null;
 
-  /* ══════════════════════════════════════════════════════════
-     IndexedDB helpers (يستخدم StorageEngine الموجود)
-  ══════════════════════════════════════════════════════════ */
-  async function ensureStores() {
-    // جدولا halls و hallBookings مُعرَّفان في StorageEngine (v8 في app.js)
-    // نتأكد فقط من أن StorageEngine جاهز ومتصل
-    if (!window.StorageEngine) {
-      console.error('[Halls] StorageEngine غير متاح — تأكد من تحميل app.js أولاً');
-      return;
-    }
-    if (!StorageEngine.db) {
-      await StorageEngine.init();
-    }
-    if (!StorageEngine.db) {
-      console.error('[Halls] فشل الاتصال بـ IndexedDB');
-      return;
-    }
-    const missing = ['halls','hallBookings'].filter(
-      n => !StorageEngine.db.objectStoreNames.contains(n)
-    );
+  // ── DB helpers ──
+  async function _ensureStores() {
+    if (!window.StorageEngine) return;
+    if (!StorageEngine.db) await StorageEngine.init();
+    // Ensure lessons store exists (v10)
+    const needed = ['halls','lessons','teachers'];
+    const missing = needed.filter(n => StorageEngine.db && !StorageEngine.db.objectStoreNames.contains(n));
     if (missing.length > 0) {
-      console.error('[Halls] الجداول التالية غير موجودة:', missing.join(', '),
-        '— تأكد من استخدام app.js المحدَّث (v8)');
+      console.warn('[Halls] missing stores:', missing);
     }
   }
 
   async function loadData() {
-    await ensureStores();
-    try {
-      halls    = await StorageEngine.getAll('halls')    || [];
-      bookings = await StorageEngine.getAll('hallBookings') || [];
-    } catch (e) {
-      halls    = [];
-      bookings = [];
-      console.warn('[Halls] load failed:', e);
-    }
+    await _ensureStores();
+    try { halls    = await StorageEngine.getAll('halls')   || []; } catch(e){ halls=[]; }
+    try { lessons  = await StorageEngine.getAll('lessons') || []; } catch(e){ lessons=[]; }
+    try { teachers = await StorageEngine.getAll('teachers')|| []; } catch(e){ teachers=[]; }
   }
 
-  async function saveHall(hall) {
-    await ensureStores();
-    await StorageEngine.save('halls', hall);
+  async function _save(store, obj) {
+    await _ensureStores();
+    await StorageEngine.save(store, obj);
+  }
+  async function _del(store, id) {
+    await _ensureStores();
+    await StorageEngine.delete(store, id);
   }
 
-  async function saveBooking(booking) {
-    await ensureStores();
-    await StorageEngine.save('hallBookings', booking);
+  // ── Helpers ──
+  function toMin(t) {
+    const [h,m] = (t||'00:00').split(':').map(Number);
+    return h*60+(m||0);
   }
-
-  async function deleteHallDB(id) {
-    await ensureStores();
-    await StorageEngine.delete('halls', id);
-  }
-
-  async function deleteBookingDB(id) {
-    await ensureStores();
-    await StorageEngine.delete('hallBookings', id);
-  }
-
-  /* ══════════════════════════════════════════════════════════
-     منطق كشف التعارض
-  ══════════════════════════════════════════════════════════ */
-  function toMinutes(timeStr) {
-    const [h, m] = (timeStr || '00:00').split(':').map(Number);
-    return h * 60 + (m || 0);
-  }
-
-  /**
-   * يكشف هل الفترة الجديدة تتعارض مع حجوزات موجودة في نفس القاعة ونفس اليوم
-   * @param {string} hallId
-   * @param {string} day        - e.g. 'Sunday'
-   * @param {string} timeFrom   - e.g. '16:00'
-   * @param {string} timeTo     - e.g. '18:00'
-   * @param {string|null} excludeBookingId  - معرّف الحجز المُعدَّل (يُستثنى من الفحص)
-   * @returns {{conflict: boolean, with: object|null}}
-   */
-  function detectConflict(hallId, day, timeFrom, timeTo, excludeBookingId = null) {
-    const newFrom = toMinutes(timeFrom);
-    const newTo   = toMinutes(timeTo);
-
-    const same = bookings.filter(b =>
-      String(b.hallId) === String(hallId) &&
-      b.day === day &&
-      String(b.id) !== String(excludeBookingId)
-    );
-
-    for (const b of same) {
-      const bFrom = toMinutes(b.timeFrom);
-      const bTo   = toMinutes(b.timeTo);
-      // تعارض: أي تداخل زمني (حتى جزئي)
-      if (newFrom < bTo && newTo > bFrom) {
-        return { conflict: true, with: b };
-      }
-    }
-    return { conflict: false, with: null };
-  }
-
-  /* ══════════════════════════════════════════════════════════
-     مساعدات عرض
-  ══════════════════════════════════════════════════════════ */
-  function gradeName(gradeId) {
-    const list = window.gradesList || [];
-    const g = list.find(x => String(x.id) === String(gradeId) || String(x.systemCode) === String(gradeId));
-    return g ? g.name : (gradeId || '---');
-  }
-
-  function groupName(groupId) {
-    const groups = (window.db && db.groups) ? db.groups : [];
-    const g = groups.find(x => String(x.id) === String(groupId));
-    return g ? g.name : (groupId ? 'مجموعة' : 'عام');
-  }
-
-  function hallColor(hall) {
-    return hall.color || HALL_COLORS[0];
-  }
-
-  function _esc(str) {
-    return String(str || '').replace(/[&<>"']/g, c =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
-    );
-  }
-
-  function notify(msg, type = 'success') {
-    if (typeof showNotification === 'function') showNotification(msg, type);
+  function _esc(s){ return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function notify(msg, type='success') {
+    if(typeof showNotification==='function') showNotification(msg, type);
     else alert(msg);
   }
+  function hallColor(h){ return h.color||HALL_COLORS[0]; }
 
-  /* ══════════════════════════════════════════════════════════
-     بناء خيارات الصفوف والمجموعات
-  ══════════════════════════════════════════════════════════ */
-  function buildGradeOptions(selectedGrade = '') {
-    const list = window.gradesList || [];
-    return list.map(g =>
-      `<option value="${_esc(String(g.id))}" ${String(g.id) === String(selectedGrade) ? 'selected' : ''}>
-        ${_esc(g.name)}
-      </option>`
-    ).join('');
+  function gradeName(gradeId){
+    const g=(window.gradesList||[]).find(x=>String(x.id)===String(gradeId)||String(x.systemCode)===String(gradeId));
+    return g?g.name:(gradeId||'---');
+  }
+  function groupName(gid){
+    if(!gid) return 'عام';
+    const g=(window.db&&db.groups||[]).find(x=>String(x.id)===String(gid));
+    return g?g.name:'مجموعة';
+  }
+  function teacherName(tid){
+    const t=teachers.find(x=>String(x.id)===String(tid));
+    return t?t.name:'---';
+  }
+  function groupStudentCount(gid){
+    if(!gid||!window.db) return 0;
+    return (db.students||[]).filter(s=>String(s.groupId)===String(gid)).length +
+           (db.enrollments||[]).filter(e=>String(e.groupId)===String(gid)).length;
   }
 
-  function buildGroupOptions(gradeId = '', selectedGroupId = '') {
-    const allGroups = (window.db && db.groups) ? db.groups : [];
-    const filtered  = gradeId
-      ? allGroups.filter(g => String(g.grade) === String(gradeId))
-      : allGroups;
-    let opts = `<option value="">-- كل المجموعات --</option>`;
-    opts += filtered.map(g =>
-      `<option value="${g.id}" ${String(g.id) === String(selectedGroupId) ? 'selected' : ''}>${_esc(g.name)}</option>`
-    ).join('');
-    return opts;
+  // ── Conflict detection ──
+  function detectHallConflict(hallId, day, from, to, excludeId=null){
+    const newF=toMin(from), newT=toMin(to);
+    const same=lessons.filter(l=>
+      String(l.hallId)===String(hallId) && l.day===day &&
+      String(l.id)!==String(excludeId)
+    );
+    for(const l of same){
+      if(newF<toMin(l.timeTo) && newT>toMin(l.timeFrom)){
+        return {conflict:true, with:l};
+      }
+    }
+    return {conflict:false, with:null};
   }
 
-  /* ══════════════════════════════════════════════════════════
-     الواجهة الرئيسية للقسم
-  ══════════════════════════════════════════════════════════ */
-  function renderHallsSection() {
-    const container = document.getElementById('halls-content');
-    if (!container) return;
+  function detectTeacherConflict(teacherId, day, from, to, excludeId=null){
+    if(!teacherId) return {conflict:false,with:null};
+    const newF=toMin(from), newT=toMin(to);
+    const same=lessons.filter(l=>
+      String(l.teacherId)===String(teacherId) && l.day===day &&
+      String(l.id)!==String(excludeId)
+    );
+    for(const l of same){
+      if(newF<toMin(l.timeTo) && newT>toMin(l.timeFrom)){
+        return {conflict:true, with:l};
+      }
+    }
+    return {conflict:false, with:null};
+  }
 
-    if (halls.length === 0) {
-      container.innerHTML = `
-        <div style="text-align:center;padding:5rem 2rem;color:var(--text-muted);">
-          <div style="font-size:4rem;margin-bottom:1rem;opacity:0.2;">🏫</div>
-          <p style="font-size:1.15rem;font-weight:700;margin-bottom:0.5rem;">لا توجد قاعات مضافة بعد</p>
-          <p style="font-size:0.9rem;margin-bottom:1.5rem;">أضف قاعتك الأولى لتبدأ في جدولة الحصص</p>
-          <button onclick="HallsModule.openAddHallModal()"
-            style="padding:0.75rem 2rem;background:var(--primary);color:white;border:none;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit;">
-            <i class="fas fa-plus"></i> إضافة قاعة
-          </button>
-        </div>`;
-      return;
+  function checkCapacity(hallId, groupId){
+    const hall=halls.find(h=>String(h.id)===String(hallId));
+    if(!hall||!hall.capacity||!groupId) return {over:false};
+    const cap=parseInt(hall.capacity)||0;
+    const count=groupStudentCount(groupId);
+    return {over:count>cap, count, cap};
+  }
+
+  // ── Build options ──
+  function buildGradeOptions(sel=''){
+    return (window.gradesList||[]).map(g=>
+      `<option value="${_esc(String(g.id))}" ${String(g.id)===String(sel)?'selected':''}>${_esc(g.name)}</option>`
+    ).join('');
+  }
+  function buildGroupOptions(gradeId='', selGrp=''){
+    const all=(window.db&&db.groups)||[];
+    const filtered=gradeId?all.filter(g=>String(g.grade)===String(gradeId)):all;
+    return `<option value="">-- كل المجموعات --</option>` +
+      filtered.map(g=>`<option value="${g.id}" ${String(g.id)===String(selGrp)?'selected':''}>${_esc(g.name)}</option>`).join('');
+  }
+  function buildTeacherOptions(selT=''){
+    return `<option value="">-- اختر المدرس --</option>` +
+      teachers.map(t=>`<option value="${t.id}" ${String(t.id)===String(selT)?'selected':''}>${_esc(t.name)}</option>`).join('');
+  }
+  function buildHallOptions(selH=''){
+    return `<option value="">-- اختر القاعة --</option>` +
+      halls.map(h=>`<option value="${h.id}" ${String(h.id)===String(selH)?'selected':''}>${_esc(h.name)}</option>`).join('');
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  RENDER MAIN HALLS SECTION
+  // ══════════════════════════════════════════════════════════
+  function renderHallsSection(){
+    const container=document.getElementById('halls-content');
+    if(!container) return;
+
+    const todayKey=DAY_KEYS[new Date().getDay()];
+    const todayLessons=lessons.filter(l=>l.day===todayKey);
+    const busyHalls=new Set(todayLessons.map(l=>String(l.hallId)));
+
+    // Stats bar
+    const totalLessons=lessons.length;
+    const totalTeachers=teachers.length;
+
+    let html = `
+      <!-- ── Dashboard ── -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.75rem;margin-bottom:1.5rem;">
+        ${[
+          {icon:'fa-building',label:'إجمالي القاعات',val:halls.length,color:'#8b5cf6'},
+          {icon:'fa-door-open',label:'مشغولة اليوم',val:busyHalls.size,color:'#ef4444'},
+          {icon:'fa-check-circle',label:'متاحة اليوم',val:halls.length-busyHalls.size,color:'#10b981'},
+          {icon:'fa-calendar-alt',label:'إجمالي الحصص',val:totalLessons,color:'#0ea5e9'},
+          {icon:'fa-chalkboard-teacher',label:'المدرسون',val:totalTeachers,color:'#f59e0b'},
+        ].map(s=>`
+          <div style="background:var(--bg-white);border-radius:14px;padding:1rem;text-align:center;box-shadow:0 1px 8px rgba(0,0,0,0.06);">
+            <i class="fas ${s.icon}" style="color:${s.color};font-size:1.3rem;display:block;margin-bottom:6px;"></i>
+            <div style="font-size:1.3rem;font-weight:800;color:${s.color};">${s.val}</div>
+            <div style="font-size:0.72rem;color:var(--text-muted);">${s.label}</div>
+          </div>`).join('')}
+      </div>
+
+      <!-- ── Tabs ── -->
+      <div style="display:flex;gap:0.5rem;margin-bottom:1.2rem;flex-wrap:wrap;">
+        <button onclick="HallsModule.showTab('halls')" id="tab-halls"
+          class="halls-tab" style="padding:0.55rem 1.2rem;border-radius:10px;border:1.5px solid var(--border);cursor:pointer;font-weight:700;font-size:0.88rem;background:var(--primary);color:white;">
+          <i class="fas fa-building"></i> القاعات
+        </button>
+        <button onclick="HallsModule.showTab('schedule')" id="tab-schedule"
+          class="halls-tab" style="padding:0.55rem 1.2rem;border-radius:10px;border:1.5px solid var(--border);cursor:pointer;font-weight:700;font-size:0.88rem;background:var(--bg-white);color:var(--text-main);">
+          <i class="fas fa-calendar-week"></i> الجدول المركزي
+        </button>
+        <button onclick="HallsModule.showTab('dashboard')" id="tab-dashboard"
+          class="halls-tab" style="padding:0.55rem 1.2rem;border-radius:10px;border:1.5px solid var(--border);cursor:pointer;font-weight:700;font-size:0.88rem;background:var(--bg-white);color:var(--text-main);">
+          <i class="fas fa-chart-bar"></i> لوحة المتابعة
+        </button>
+      </div>
+
+      <!-- ── Tab Content ── -->
+      <div id="halls-tab-content"></div>`;
+
+    container.innerHTML = html;
+    showTab('halls');
+  }
+
+  function showTab(tab){
+    // Update tab buttons style
+    document.querySelectorAll('.halls-tab').forEach(btn=>{
+      btn.style.background='var(--bg-white)';
+      btn.style.color='var(--text-main)';
+      btn.style.borderColor='var(--border)';
+    });
+    const activeBtn=document.getElementById(`tab-${tab}`);
+    if(activeBtn){ activeBtn.style.background='var(--primary)'; activeBtn.style.color='white'; }
+
+    const tc=document.getElementById('halls-tab-content');
+    if(!tc) return;
+
+    if(tab==='halls')      tc.innerHTML=renderHallsGrid();
+    else if(tab==='schedule') tc.innerHTML=renderCentralSchedule();
+    else if(tab==='dashboard') tc.innerHTML=renderDashboard();
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  HALLS GRID TAB
+  // ══════════════════════════════════════════════════════════
+  function renderHallsGrid(){
+    const todayKey=DAY_KEYS[new Date().getDay()];
+
+    if(halls.length===0){
+      return `<div style="text-align:center;padding:4rem 2rem;color:var(--text-muted);">
+        <div style="font-size:3.5rem;margin-bottom:1rem;opacity:0.2;">🏫</div>
+        <p style="font-size:1.1rem;font-weight:700;margin-bottom:1.5rem;">لا توجد قاعات مضافة بعد</p>
+        <button onclick="HallsModule.openAddHallModal()"
+          style="padding:0.75rem 2rem;background:var(--primary);color:white;border:none;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit;">
+          <i class="fas fa-plus"></i> إضافة قاعة
+        </button>
+      </div>`;
     }
 
-    // ── شبكة القاعات ──
-    let html = `
-      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1.2rem;margin-bottom:1.5rem;">
-        ${halls.map(h => _hallCard(h)).join('')}
+    return `
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1.1rem;">
+        ${halls.map(h=>_hallCard(h, todayKey)).join('')}
         <div onclick="HallsModule.openAddHallModal()"
-          style="border:2px dashed var(--border);border-radius:18px;padding:2rem;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5rem;cursor:pointer;min-height:140px;color:var(--text-muted);transition:all 0.2s;"
+          style="border:2px dashed var(--border);border-radius:18px;padding:2rem;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:0.5rem;cursor:pointer;min-height:160px;color:var(--text-muted);transition:all 0.2s;"
           onmouseover="this.style.borderColor='var(--primary)';this.style.color='var(--primary)'"
           onmouseout="this.style.borderColor='var(--border)';this.style.color='var(--text-muted)'">
           <i class="fas fa-plus-circle" style="font-size:2rem;"></i>
           <span style="font-weight:700;">إضافة قاعة جديدة</span>
         </div>
-      </div>`;
-
-    container.innerHTML = html;
-
-    // لو في قاعة مفتوحة → اعرض تفاصيلها
-    if (activeHallId) renderHallDetail(activeHallId);
+      </div>
+      <div id="hall-detail-panel" style="margin-top:1rem;"></div>`;
   }
 
-  function _hallCard(hall) {
-    const color = hallColor(hall);
-    const hallBookings = bookings.filter(b => String(b.hallId) === String(hall.id));
-    const todayKey = DAY_KEYS[new Date().getDay()];
-    const todayCount = hallBookings.filter(b => b.day === todayKey).length;
+  function _hallCard(hall, todayKey){
+    const color=hallColor(hall);
+    const hallLessons=lessons.filter(l=>String(l.hallId)===String(hall.id));
+    const todayCount=hallLessons.filter(l=>l.day===todayKey).length;
+    const isBusy=todayCount>0;
+    const cap=hall.capacity?`• سعة: ${hall.capacity} طالب`:'';
 
     return `
       <div onclick="HallsModule.openHallDetail('${hall.id}')"
@@ -240,7 +257,6 @@
                border:1.5px solid var(--border);cursor:pointer;transition:all 0.2s;position:relative;overflow:hidden;"
         onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 24px rgba(0,0,0,0.1)'"
         onmouseout="this.style.transform='';this.style.boxShadow='0 2px 12px rgba(0,0,0,0.06)'">
-        <!-- شريط اللون -->
         <div style="position:absolute;top:0;right:0;left:0;height:4px;background:${color};border-radius:18px 18px 0 0;"></div>
 
         <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-top:0.5rem;">
@@ -249,213 +265,428 @@
               <i class="fas fa-door-open" style="color:${color};font-size:1.2rem;"></i>
             </div>
             <div style="font-weight:800;font-size:1.05rem;color:var(--text-main);">${_esc(hall.name)}</div>
-            <div style="font-size:0.8rem;color:var(--text-muted);margin-top:3px;">
-              ${hallBookings.length} حجز إجمالاً
-              ${todayCount ? `· <span style="color:${color};font-weight:700;">${todayCount} اليوم</span>` : ''}
-            </div>
+            <div style="font-size:0.78rem;color:var(--text-muted);margin-top:2px;">${hallLessons.length} حصة إجمالاً ${cap}</div>
           </div>
-          <div style="display:flex;gap:5px;" onclick="event.stopPropagation()">
-            <button onclick="HallsModule.openEditHallModal('${hall.id}')"
-              title="تعديل اسم القاعة"
-              style="width:30px;height:30px;border:none;background:var(--bg-light);border-radius:8px;cursor:pointer;color:var(--primary);">
-              <i class="fas fa-edit" style="font-size:0.75rem;"></i>
-            </button>
-            <button onclick="HallsModule.deleteHall('${hall.id}')"
-              title="حذف القاعة"
-              style="width:30px;height:30px;border:none;background:#fef2f2;border-radius:8px;cursor:pointer;color:#ef4444;">
-              <i class="fas fa-trash" style="font-size:0.75rem;"></i>
-            </button>
+          <div>
+            <span style="padding:4px 10px;border-radius:20px;font-size:0.72rem;font-weight:700;
+              background:${isBusy?'#fef2f2':'#f0fdf4'};color:${isBusy?'#ef4444':'#16a34a'};">
+              ${isBusy?'مشغولة اليوم':'متاحة اليوم'}
+            </span>
           </div>
         </div>
 
-        <!-- أيام النشاط -->
         <div style="display:flex;gap:4px;margin-top:0.9rem;flex-wrap:wrap;">
-          ${DAY_KEYS.map((dk, i) => {
-            const has = hallBookings.some(b => b.day === dk);
-            return has
-              ? `<span style="background:${color}20;color:${color};border-radius:6px;padding:2px 8px;font-size:0.72rem;font-weight:700;">${ARABIC_DAYS[i]}</span>`
-              : '';
+          ${DAY_KEYS.map((dk,i)=>{
+            const has=hallLessons.some(l=>l.day===dk);
+            return has?`<span style="background:${color}20;color:${color};border-radius:6px;padding:2px 8px;font-size:0.72rem;font-weight:700;">${ARABIC_DAYS[i]}</span>`:'';
           }).join('')}
+        </div>
+
+        <div style="display:flex;gap:5px;margin-top:0.8rem;" onclick="event.stopPropagation()">
+          <button onclick="HallsModule.openEditHallModal('${hall.id}')"
+            style="flex:1;padding:5px 0;border:none;background:var(--bg-light);border-radius:8px;cursor:pointer;color:var(--primary);font-size:0.78rem;">
+            <i class="fas fa-edit"></i> تعديل
+          </button>
+          <button onclick="HallsModule.openAddLessonModal('${hall.id}')"
+            style="flex:1;padding:5px 0;border:none;background:${color}15;border-radius:8px;cursor:pointer;color:${color};font-size:0.78rem;font-weight:700;">
+            <i class="fas fa-plus"></i> حصة
+          </button>
+          <button onclick="HallsModule.deleteHall('${hall.id}')"
+            style="padding:5px 10px;border:none;background:#fef2f2;border-radius:8px;cursor:pointer;color:#ef4444;font-size:0.78rem;">
+            <i class="fas fa-trash"></i>
+          </button>
         </div>
       </div>`;
   }
 
-  /* ══════════════════════════════════════════════════════════
-     تفاصيل القاعة — الجدول الأسبوعي
-  ══════════════════════════════════════════════════════════ */
-  function renderHallDetail(hallId) {
-    activeHallId = hallId;
-    const hall = halls.find(h => String(h.id) === String(hallId));
-    if (!hall) return;
+  // ── Hall Detail Panel ──
+  function openHallDetail(hallId){
+    activeHallId=hallId;
+    const hall=halls.find(h=>String(h.id)===String(hallId));
+    if(!hall) return;
+    const color=hallColor(hall);
+    const hallLessons=lessons.filter(l=>String(l.hallId)===String(hallId))
+      .sort((a,b)=>DAY_KEYS.indexOf(a.day)-DAY_KEYS.indexOf(b.day)||toMin(a.timeFrom)-toMin(b.timeFrom));
 
-    const color = hallColor(hall);
-    const hallBookings = bookings
-      .filter(b => String(b.hallId) === String(hallId))
-      .sort((a, b) => toMinutes(a.timeFrom) - toMinutes(b.timeFrom));
+    const byDay={};
+    DAY_KEYS.forEach(dk=>{byDay[dk]=[];});
+    hallLessons.forEach(l=>{if(byDay[l.day])byDay[l.day].push(l);});
 
-    // تجميع بالأيام
-    const byDay = {};
-    DAY_KEYS.forEach(dk => { byDay[dk] = []; });
-    hallBookings.forEach(b => { if (byDay[b.day]) byDay[b.day].push(b); });
+    const cap=hall.capacity?`| السعة: ${hall.capacity}`:'';
 
-    // إضافة div التفاصيل لو مش موجود
-    let detailEl = document.getElementById('hall-detail-panel');
-    if (!detailEl) {
-      detailEl = document.createElement('div');
-      detailEl.id = 'hall-detail-panel';
-      document.getElementById('halls-content').appendChild(detailEl);
-    }
+    const panel=document.getElementById('hall-detail-panel');
+    if(!panel) return;
 
-    detailEl.style.cssText = `
-      background:var(--bg-white);border-radius:20px;
-      box-shadow:0 4px 24px rgba(0,0,0,0.08);
-      border:1.5px solid var(--border);overflow:hidden;margin-top:0.5rem;`;
-
-    detailEl.innerHTML = `
-      <!-- هيدر القاعة -->
-      <div style="background:${color};padding:1.4rem 1.6rem;color:white;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;">
+    panel.style.cssText='background:var(--bg-white);border-radius:20px;box-shadow:0 4px 24px rgba(0,0,0,0.08);border:1.5px solid var(--border);overflow:hidden;';
+    panel.innerHTML=`
+      <div style="background:${color};padding:1.4rem 1.6rem;color:white;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem;">
         <div>
-          <div style="font-size:1.25rem;font-weight:800;"><i class="fas fa-door-open"></i> ${_esc(hall.name)}</div>
-          <div style="font-size:0.85rem;opacity:0.85;margin-top:4px;">${hallBookings.length} حجز مجدوَل هذا الأسبوع</div>
+          <div style="font-size:1.2rem;font-weight:800;"><i class="fas fa-door-open"></i> ${_esc(hall.name)}</div>
+          <div style="font-size:0.82rem;opacity:0.85;margin-top:3px;">${hallLessons.length} حصة مجدولة ${cap}</div>
         </div>
-        <div style="display:flex;gap:0.6rem;flex-wrap:wrap;">
-          <button onclick="HallsModule.openAddBookingModal('${hall.id}')"
-            style="padding:0.6rem 1.2rem;background:white;color:${color};border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.88rem;">
-            <i class="fas fa-plus"></i> إضافة حجز
+        <div style="display:flex;gap:0.6rem;">
+          <button onclick="HallsModule.openAddLessonModal('${hall.id}')"
+            style="padding:0.5rem 1.1rem;background:white;color:${color};border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.85rem;">
+            <i class="fas fa-plus"></i> حصة جديدة
           </button>
-          <button onclick="HallsModule.closeHallDetail()"
-            style="padding:0.6rem 0.9rem;background:rgba(255,255,255,0.2);color:white;border:1px solid rgba(255,255,255,0.4);border-radius:10px;cursor:pointer;">
+          <button onclick="document.getElementById('hall-detail-panel').style.display='none';HallsModule._activeHallId=null"
+            style="padding:0.5rem 0.8rem;background:rgba(255,255,255,0.2);color:white;border:1px solid rgba(255,255,255,0.4);border-radius:10px;cursor:pointer;">
             <i class="fas fa-times"></i>
           </button>
         </div>
       </div>
 
-      <!-- الجدول الأسبوعي -->
-      <div style="padding:1.4rem;overflow-x:auto;">
-        <table style="width:100%;border-collapse:collapse;min-width:700px;">
+      <!-- Weekly Table -->
+      <div style="padding:1.2rem;overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;min-width:600px;">
           <thead>
             <tr style="background:var(--bg-light);">
-              ${DAY_KEYS.map((dk, i) => `
-                <th style="padding:0.75rem 0.5rem;text-align:center;font-size:0.82rem;font-weight:800;
-                           color:${dk === DAY_KEYS[new Date().getDay()] ? color : 'var(--text-main)'};
-                           border-bottom:2px solid ${dk === DAY_KEYS[new Date().getDay()] ? color : 'var(--border)'};
-                           min-width:120px;">
+              ${DAY_KEYS.map((dk,i)=>`
+                <th style="padding:0.7rem 0.4rem;text-align:center;font-size:0.8rem;font-weight:800;
+                  color:${dk===DAY_KEYS[new Date().getDay()]?color:'var(--text-main)'};
+                  border-bottom:2px solid ${dk===DAY_KEYS[new Date().getDay()]?color:'var(--border)'};
+                  min-width:110px;">
                   ${ARABIC_DAYS[i]}
-                  ${dk === DAY_KEYS[new Date().getDay()] ? '<br><span style="font-size:0.65rem;opacity:0.7;">اليوم</span>' : ''}
+                  ${dk===DAY_KEYS[new Date().getDay()]?'<br><span style="font-size:0.62rem;opacity:0.7;">اليوم</span>':''}
                 </th>`).join('')}
             </tr>
           </thead>
           <tbody>
             <tr style="vertical-align:top;">
-              ${DAY_KEYS.map(dk => `
-                <td style="padding:0.5rem;border-left:1px solid var(--border);">
-                  ${byDay[dk].length === 0
-                    ? `<div style="min-height:60px;display:flex;align-items:center;justify-content:center;">
-                         <button onclick="HallsModule.openAddBookingModal('${hall.id}','${dk}')"
-                           style="color:var(--text-muted);border:1.5px dashed var(--border);background:none;border-radius:8px;padding:6px 10px;cursor:pointer;font-size:0.75rem;width:100%;">
-                           <i class="fas fa-plus"></i>
-                         </button>
-                       </div>`
-                    : byDay[dk].map(b => _bookingCard(b, color)).join('')
-                  }
+              ${DAY_KEYS.map(dk=>`
+                <td style="padding:0.4rem;border-left:1px solid var(--border);">
+                  ${byDay[dk].length===0
+                    ?`<div style="min-height:50px;display:flex;align-items:center;justify-content:center;">
+                        <button onclick="HallsModule.openAddLessonModal('${hall.id}','${dk}')"
+                          style="color:var(--text-muted);border:1.5px dashed var(--border);background:none;border-radius:8px;padding:5px 8px;cursor:pointer;font-size:0.72rem;width:100%;">
+                          <i class="fas fa-plus"></i>
+                        </button>
+                      </div>`
+                    :byDay[dk].map(l=>_lessonMiniCard(l,color)).join('')}
                 </td>`).join('')}
             </tr>
           </tbody>
         </table>
       </div>
 
-      <!-- قائمة مدمجة بكل الحجوزات -->
-      <div style="padding:0 1.4rem 1.4rem;">
-        <div style="font-size:0.82rem;font-weight:800;color:var(--text-muted);margin-bottom:0.75rem;text-transform:uppercase;letter-spacing:0.05em;">
-          كل الحجوزات (${hallBookings.length})
-        </div>
-        ${hallBookings.length === 0
-          ? `<div style="text-align:center;padding:2rem;color:var(--text-muted);font-size:0.9rem;">لا توجد حجوزات بعد</div>`
-          : `<div style="display:flex;flex-direction:column;gap:0.5rem;">
-              ${hallBookings.map(b => _bookingListRow(b, color)).join('')}
-             </div>`
-        }
+      <!-- Lessons List -->
+      <div style="padding:0 1.2rem 1.2rem;">
+        <div style="font-size:0.8rem;font-weight:800;color:var(--text-muted);margin-bottom:0.6rem;">كل الحصص (${hallLessons.length})</div>
+        ${hallLessons.length===0
+          ?`<div style="text-align:center;padding:1.5rem;color:var(--text-muted);font-size:0.88rem;">لا توجد حصص بعد</div>`
+          :hallLessons.map(l=>_lessonRow(l,color)).join('')}
       </div>`;
   }
 
-  function _bookingCard(b, color) {
-    const gName  = gradeName(b.grade);
-    const grpName = groupName(b.groupId);
+  function _lessonMiniCard(l, color){
+    const tName=teacherName(l.teacherId);
+    const grpName=groupName(l.groupId);
     return `
-      <div style="background:${color}12;border:1.5px solid ${color}30;border-radius:10px;padding:0.55rem 0.65rem;margin-bottom:0.4rem;">
-        <div style="font-size:0.78rem;font-weight:800;color:${color};">${_esc(b.timeFrom)} — ${_esc(b.timeTo)}</div>
-        <div style="font-size:0.75rem;color:var(--text-main);margin-top:2px;font-weight:700;">${_esc(gName)}</div>
-        <div style="font-size:0.72rem;color:var(--text-muted);">${_esc(grpName)}</div>
-        <div style="display:flex;gap:4px;margin-top:5px;">
-          <button onclick="HallsModule.openEditBookingModal('${b.id}')"
-            style="flex:1;font-size:0.68rem;padding:3px 0;border:none;background:white;border-radius:6px;cursor:pointer;color:var(--primary);">
+      <div style="background:${color}12;border:1.5px solid ${color}30;border-radius:9px;padding:0.45rem 0.55rem;margin-bottom:0.35rem;">
+        <div style="font-size:0.75rem;font-weight:800;color:${color};">${_esc(l.timeFrom)}–${_esc(l.timeTo)}</div>
+        <div style="font-size:0.72rem;color:var(--text-main);font-weight:700;margin-top:1px;">${_esc(tName)}</div>
+        <div style="font-size:0.68rem;color:var(--text-muted);">${_esc(l.subject||gradeName(l.grade))} · ${_esc(grpName)}</div>
+        <div style="display:flex;gap:3px;margin-top:4px;">
+          <button onclick="HallsModule.openEditLessonModal('${l.id}')"
+            style="flex:1;font-size:0.66rem;padding:2px 0;border:none;background:white;border-radius:5px;cursor:pointer;color:var(--primary);">
             <i class="fas fa-edit"></i>
           </button>
-          <button onclick="HallsModule.deleteBooking('${b.id}')"
-            style="flex:1;font-size:0.68rem;padding:3px 0;border:none;background:#fef2f2;border-radius:6px;cursor:pointer;color:#ef4444;">
+          <button onclick="HallsModule.deleteLesson('${l.id}')"
+            style="flex:1;font-size:0.66rem;padding:2px 0;border:none;background:#fef2f2;border-radius:5px;cursor:pointer;color:#ef4444;">
             <i class="fas fa-trash"></i>
           </button>
         </div>
       </div>`;
   }
 
-  function _bookingListRow(b, color) {
-    const dayLabel = ARABIC_DAYS[DAY_KEYS.indexOf(b.day)] || b.day;
-    const gName    = gradeName(b.grade);
-    const grpName  = groupName(b.groupId);
+  function _lessonRow(l, color){
+    const dayLabel=ARABIC_DAYS[DAY_KEYS.indexOf(l.day)]||l.day;
+    const tName=teacherName(l.teacherId);
+    const grpName=groupName(l.groupId);
+    const gName=gradeName(l.grade);
     return `
-      <div style="display:flex;align-items:center;gap:0.8rem;padding:0.7rem 0.9rem;background:var(--bg-light);border-radius:12px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:0.7rem;padding:0.65rem 0.85rem;background:var(--bg-light);border-radius:11px;margin-bottom:0.4rem;flex-wrap:wrap;">
         <div style="width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0;"></div>
-        <div style="font-weight:700;color:${color};min-width:70px;font-size:0.85rem;">${_esc(dayLabel)}</div>
-        <div style="font-size:0.82rem;color:var(--text-muted);min-width:90px;">
-          <i class="fas fa-clock" style="font-size:0.7rem;margin-left:3px;"></i>${_esc(b.timeFrom)} — ${_esc(b.timeTo)}
-        </div>
-        <div style="font-size:0.82rem;font-weight:700;flex:1;">${_esc(gName)} · ${_esc(grpName)}</div>
-        ${b.notes ? `<div style="font-size:0.75rem;color:var(--text-muted);font-style:italic;">${_esc(b.notes)}</div>` : ''}
-        <div style="display:flex;gap:5px;margin-right:auto;">
-          <button onclick="HallsModule.openEditBookingModal('${b.id}')"
-            style="padding:4px 10px;border:none;background:var(--primary);color:white;border-radius:8px;cursor:pointer;font-size:0.75rem;">
+        <div style="font-weight:700;color:${color};min-width:65px;font-size:0.82rem;">${_esc(dayLabel)}</div>
+        <div style="font-size:0.8rem;color:var(--text-muted);min-width:85px;"><i class="fas fa-clock" style="font-size:0.68rem;margin-left:2px;"></i>${_esc(l.timeFrom)}–${_esc(l.timeTo)}</div>
+        <div style="font-size:0.8rem;font-weight:700;flex:1;">${_esc(tName)} · ${_esc(l.subject||gName)} · ${_esc(grpName)}</div>
+        <div style="display:flex;gap:4px;">
+          <button onclick="HallsModule.openEditLessonModal('${l.id}')"
+            style="padding:4px 9px;border:none;background:var(--primary);color:white;border-radius:7px;cursor:pointer;font-size:0.72rem;">
             <i class="fas fa-edit"></i>
           </button>
-          <button onclick="HallsModule.deleteBooking('${b.id}')"
-            style="padding:4px 10px;border:none;background:#fef2f2;color:#ef4444;border-radius:8px;cursor:pointer;font-size:0.75rem;">
+          <button onclick="HallsModule.deleteLesson('${l.id}')"
+            style="padding:4px 9px;border:none;background:#fef2f2;color:#ef4444;border-radius:7px;cursor:pointer;font-size:0.72rem;">
             <i class="fas fa-trash"></i>
           </button>
         </div>
       </div>`;
   }
 
-  function closeHallDetail() {
-    activeHallId = null;
-    const el = document.getElementById('hall-detail-panel');
-    if (el) el.remove();
+  // ══════════════════════════════════════════════════════════
+  //  CENTRAL SCHEDULE TAB
+  // ══════════════════════════════════════════════════════════
+  function renderCentralSchedule(){
+    const sorted=[...lessons].sort((a,b)=>DAY_KEYS.indexOf(a.day)-DAY_KEYS.indexOf(b.day)||toMin(a.timeFrom)-toMin(b.timeFrom));
+
+    return `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;flex-wrap:wrap;gap:0.75rem;">
+        <div style="font-size:0.95rem;font-weight:800;color:var(--text-main);">
+          <i class="fas fa-calendar-week" style="color:var(--primary);margin-left:6px;"></i>
+          الجدول المركزي للحصص (${lessons.length})
+        </div>
+        <button onclick="HallsModule.openAddLessonModal()"
+          style="padding:0.55rem 1.2rem;background:var(--primary);color:white;border:none;border-radius:10px;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.88rem;">
+          <i class="fas fa-plus"></i> إضافة حصة
+        </button>
+      </div>
+
+      <!-- Filter by day -->
+      <div style="display:flex;gap:0.4rem;margin-bottom:1rem;flex-wrap:wrap;">
+        <button onclick="HallsModule._filterDay('')" id="day-filter-all"
+          style="padding:4px 12px;border-radius:20px;border:1.5px solid var(--primary);background:var(--primary);color:white;cursor:pointer;font-size:0.78rem;font-weight:700;">كل الأيام</button>
+        ${DAY_KEYS.map((dk,i)=>`
+          <button onclick="HallsModule._filterDay('${dk}')" id="day-filter-${dk}"
+            style="padding:4px 12px;border-radius:20px;border:1.5px solid var(--border);background:var(--bg-white);color:var(--text-muted);cursor:pointer;font-size:0.78rem;font-weight:700;">
+            ${ARABIC_DAYS[i]}
+          </button>`).join('')}
+      </div>
+
+      <div id="lessons-list">
+        ${sorted.length===0
+          ?`<div style="text-align:center;padding:3rem;color:var(--text-muted);">
+              <i class="fas fa-calendar-times" style="font-size:2.5rem;opacity:0.3;display:block;margin-bottom:1rem;"></i>
+              <p>لا توجد حصص مضافة بعد</p>
+            </div>`
+          :sorted.map(l=>_centralLessonRow(l)).join('')}
+      </div>`;
   }
 
-  /* ══════════════════════════════════════════════════════════
-     مودال إضافة / تعديل قاعة
-  ══════════════════════════════════════════════════════════ */
-  function openAddHallModal() {
-    editingHallId = null;
-    _showHallModal({ name: '', color: HALL_COLORS[0] });
+  function _filterDay(day){
+    // Update button styles
+    document.querySelectorAll('[id^="day-filter-"]').forEach(btn=>{
+      btn.style.background='var(--bg-white)';btn.style.color='var(--text-muted)';btn.style.borderColor='var(--border)';
+    });
+    const activeId=day?`day-filter-${day}`:'day-filter-all';
+    const activeBtn=document.getElementById(activeId);
+    if(activeBtn){activeBtn.style.background='var(--primary)';activeBtn.style.color='white';}
+
+    const filtered=day?lessons.filter(l=>l.day===day):[...lessons];
+    const sorted=filtered.sort((a,b)=>DAY_KEYS.indexOf(a.day)-DAY_KEYS.indexOf(b.day)||toMin(a.timeFrom)-toMin(b.timeFrom));
+    const container=document.getElementById('lessons-list');
+    if(container) container.innerHTML=sorted.map(l=>_centralLessonRow(l)).join('') ||
+      `<div style="text-align:center;padding:2rem;color:var(--text-muted);">لا توجد حصص في هذا اليوم</div>`;
   }
 
-  function openEditHallModal(hallId) {
-    editingHallId = hallId;
-    const hall = halls.find(h => String(h.id) === String(hallId));
-    if (!hall) return;
-    _showHallModal(hall);
+  function _centralLessonRow(l){
+    const dayLabel=ARABIC_DAYS[DAY_KEYS.indexOf(l.day)]||l.day;
+    const hall=halls.find(h=>String(h.id)===String(l.hallId));
+    const color=hall?hallColor(hall):'#8b5cf6';
+    const tName=teacherName(l.teacherId);
+    const grpName=groupName(l.groupId);
+    const gName=gradeName(l.grade);
+    const todayKey=DAY_KEYS[new Date().getDay()];
+    const isToday=l.day===todayKey;
+
+    return `
+      <div style="display:flex;align-items:center;gap:0.75rem;padding:0.85rem 1rem;background:var(--bg-white);
+        border-radius:13px;margin-bottom:0.45rem;box-shadow:0 1px 6px rgba(0,0,0,0.05);flex-wrap:wrap;
+        border-right:4px solid ${color};${isToday?'border:1.5px solid '+color+';border-right:4px solid '+color+';':''}">
+        <div style="min-width:75px;">
+          <span style="padding:3px 9px;border-radius:20px;font-size:0.72rem;font-weight:700;
+            background:${color}20;color:${color};">${_esc(dayLabel)}</span>
+          ${isToday?'<span style="padding:2px 6px;border-radius:20px;font-size:0.65rem;font-weight:700;background:#10b981;color:white;margin-right:3px;">اليوم</span>':''}
+        </div>
+        <div style="font-size:0.82rem;font-weight:700;color:var(--text-muted);min-width:90px;">
+          <i class="fas fa-clock" style="font-size:0.7rem;margin-left:3px;"></i>${_esc(l.timeFrom)}–${_esc(l.timeTo)}
+        </div>
+        <div style="flex:1;min-width:140px;">
+          <div style="font-size:0.85rem;font-weight:800;color:var(--text-main);">
+            <i class="fas fa-chalkboard-teacher" style="color:#4f46e5;margin-left:4px;font-size:0.78rem;"></i>${_esc(tName)}
+          </div>
+          <div style="font-size:0.75rem;color:var(--text-muted);">${_esc(l.subject||gName)} · ${_esc(grpName)}</div>
+        </div>
+        <div style="font-size:0.8rem;font-weight:700;color:${color};">
+          <i class="fas fa-door-open" style="font-size:0.72rem;margin-left:3px;"></i>${_esc(hall?hall.name:'---')}
+        </div>
+        <div style="display:flex;gap:5px;">
+          <button onclick="HallsModule.openEditLessonModal('${l.id}')"
+            style="padding:5px 10px;border:none;background:var(--primary);color:white;border-radius:8px;cursor:pointer;font-size:0.75rem;">
+            <i class="fas fa-edit"></i>
+          </button>
+          <button onclick="HallsModule.deleteLesson('${l.id}')"
+            style="padding:5px 10px;border:none;background:#fef2f2;color:#ef4444;border-radius:8px;cursor:pointer;font-size:0.75rem;">
+            <i class="fas fa-trash"></i>
+          </button>
+        </div>
+      </div>`;
   }
 
-  function _showHallModal(hall) {
+  // ══════════════════════════════════════════════════════════
+  //  DASHBOARD TAB
+  // ══════════════════════════════════════════════════════════
+  function renderDashboard(){
+    const todayKey=DAY_KEYS[new Date().getDay()];
+    const todayLessons=lessons.filter(l=>l.day===todayKey)
+      .sort((a,b)=>toMin(a.timeFrom)-toMin(b.timeFrom));
+    const upcomingLessons=lessons.filter(l=>{
+      const dayIdx=DAY_KEYS.indexOf(l.day);
+      const todayIdx=new Date().getDay();
+      return dayIdx>todayIdx;
+    }).sort((a,b)=>DAY_KEYS.indexOf(a.day)-DAY_KEYS.indexOf(b.day)||toMin(a.timeFrom)-toMin(b.timeFrom)).slice(0,10);
+
+    // Teacher summary
+    const teacherStats=teachers.map(t=>{
+      const tLessons=lessons.filter(l=>String(l.teacherId)===String(t.id));
+      const weeklyCount=tLessons.length;
+      return {t, weeklyCount, lessons:tLessons};
+    });
+
+    // Hall status
+    const hallStatus=halls.map(h=>{
+      const hLessons=lessons.filter(l=>String(l.hallId)===String(h.id));
+      const todayH=hLessons.filter(l=>l.day===todayKey);
+      const groups=new Set(hLessons.map(l=>l.groupId).filter(Boolean));
+      return {h, hLessons, todayH, groups};
+    });
+
+    return `
+      <!-- Today's Lessons -->
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 8px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-calendar-day" style="margin-left:6px;"></i> حصص اليوم (${todayLessons.length})
+        </h3>
+        ${todayLessons.length===0
+          ?`<p style="color:var(--text-muted);font-size:0.85rem;text-align:center;padding:1rem;">لا توجد حصص مجدولة اليوم</p>`
+          :todayLessons.map(l=>{
+            const hall=halls.find(h=>String(h.id)===String(l.hallId));
+            const color=hall?hallColor(hall):'#8b5cf6';
+            const now=new Date();
+            const curMin=now.getHours()*60+now.getMinutes();
+            const lFrom=toMin(l.timeFrom), lTo=toMin(l.timeTo);
+            const isNow=curMin>=lFrom&&curMin<lTo;
+            return `
+              <div style="display:flex;align-items:center;gap:0.75rem;padding:0.75rem;border-radius:11px;
+                background:${isNow?color+'15':'var(--bg-light)'};border:${isNow?'1.5px solid '+color:'1.5px solid transparent'};margin-bottom:0.4rem;flex-wrap:wrap;">
+                <div style="width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0;"></div>
+                <div style="font-weight:700;font-size:0.83rem;color:${color};min-width:80px;">
+                  ${l.timeFrom}–${l.timeTo}
+                  ${isNow?'<span style="background:'+color+';color:white;border-radius:10px;padding:1px 6px;font-size:0.65rem;margin-right:4px;">جارية</span>':''}
+                </div>
+                <div style="flex:1;font-size:0.82rem;">
+                  <strong>${_esc(teacherName(l.teacherId))}</strong> · ${_esc(l.subject||gradeName(l.grade))} · ${_esc(groupName(l.groupId))}
+                </div>
+                <div style="font-size:0.78rem;color:${color};font-weight:700;">
+                  <i class="fas fa-door-open" style="margin-left:3px;font-size:0.7rem;"></i>${_esc(hall?hall.name:'---')}
+                </div>
+              </div>`;
+          }).join('')}
+      </div>
+
+      <!-- Upcoming Lessons -->
+      ${upcomingLessons.length>0?`
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 8px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-clock" style="margin-left:6px;"></i> الحصص القادمة هذا الأسبوع
+        </h3>
+        ${upcomingLessons.map(l=>{
+          const hall=halls.find(h=>String(h.id)===String(l.hallId));
+          const color=hall?hallColor(hall):'#8b5cf6';
+          const dayLabel=ARABIC_DAYS[DAY_KEYS.indexOf(l.day)]||l.day;
+          return `
+            <div style="display:flex;align-items:center;gap:0.75rem;padding:0.65rem;border-radius:10px;background:var(--bg-light);margin-bottom:0.35rem;flex-wrap:wrap;">
+              <span style="padding:2px 9px;border-radius:20px;font-size:0.72rem;font-weight:700;background:${color}20;color:${color};">${dayLabel}</span>
+              <span style="font-size:0.8rem;color:var(--text-muted);">${l.timeFrom}–${l.timeTo}</span>
+              <span style="font-size:0.82rem;font-weight:700;flex:1;">${_esc(teacherName(l.teacherId))} · ${_esc(l.subject||gradeName(l.grade))}</span>
+              <span style="font-size:0.78rem;color:${color};">${_esc(hall?hall.name:'---')}</span>
+            </div>`;
+        }).join('')}
+      </div>`:``}
+
+      <!-- Halls Status -->
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 8px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-building" style="margin-left:6px;"></i> حالة القاعات اليوم
+        </h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0.75rem;">
+          ${hallStatus.map(({h,hLessons,todayH,groups})=>{
+            const color=hallColor(h);
+            const busy=todayH.length>0;
+            return `
+              <div style="border-radius:12px;padding:0.9rem;background:${busy?color+'12':'#f0fdf4'};border:1.5px solid ${busy?color+'40':'#bbf7d0'};">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem;">
+                  <div style="font-weight:800;font-size:0.88rem;">${_esc(h.name)}</div>
+                  <span style="padding:2px 8px;border-radius:20px;font-size:0.7rem;font-weight:700;
+                    background:${busy?'#fef2f2':'#f0fdf4'};color:${busy?'#ef4444':'#16a34a'};">
+                    ${busy?'مشغولة':'متاحة'}
+                  </span>
+                </div>
+                <div style="font-size:0.75rem;color:var(--text-muted);">
+                  ${h.capacity?`السعة: ${h.capacity} | `:''}${hLessons.length} حصة/أسبوع
+                  ${todayH.length?` | ${todayH.length} حصة اليوم`:''}
+                </div>
+                ${todayH.map(l=>`
+                  <div style="font-size:0.72rem;margin-top:3px;color:${color};font-weight:700;">
+                    ${l.timeFrom}–${l.timeTo}: ${_esc(teacherName(l.teacherId))}
+                  </div>`).join('')}
+              </div>`;
+          }).join('')}
+        </div>
+      </div>
+
+      <!-- Teachers Summary -->
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;box-shadow:0 1px 8px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-chalkboard-teacher" style="margin-left:6px;"></i> ملخص جداول المدرسين
+        </h3>
+        ${teacherStats.length===0
+          ?`<p style="color:var(--text-muted);font-size:0.85rem;">لا يوجد مدرسون مضافون</p>`
+          :`<div style="overflow-x:auto;">
+              <table style="width:100%;border-collapse:collapse;font-size:0.83rem;min-width:450px;">
+                <thead>
+                  <tr style="background:var(--bg-light);">
+                    <th style="padding:8px 12px;text-align:right;">المدرس</th>
+                    <th style="padding:8px 12px;text-align:center;">المادة</th>
+                    <th style="padding:8px 12px;text-align:center;">حصص/أسبوع</th>
+                    <th style="padding:8px 12px;text-align:center;">أيام التدريس</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${teacherStats.map(({t,weeklyCount,lessons:tLessons})=>{
+                    const activeDays=[...new Set(tLessons.map(l=>ARABIC_DAYS[DAY_KEYS.indexOf(l.day)]))].join('، ');
+                    return `
+                      <tr style="border-bottom:1px solid var(--bg-light);">
+                        <td style="padding:8px 12px;font-weight:700;">${_esc(t.name)}</td>
+                        <td style="padding:8px 12px;text-align:center;color:var(--text-muted);">${_esc(t.subject||'---')}</td>
+                        <td style="padding:8px 12px;text-align:center;font-weight:800;color:var(--primary);">${weeklyCount}</td>
+                        <td style="padding:8px 12px;text-align:center;font-size:0.77rem;">${activeDays||'---'}</td>
+                      </tr>`;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>`}
+      </div>`;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  HALL MODAL (Add/Edit)
+  // ══════════════════════════════════════════════════════════
+  function openAddHallModal(){ editingHallId=null; _showHallModal({name:'',capacity:'',color:HALL_COLORS[0]}); }
+  function openEditHallModal(id){
+    editingHallId=id;
+    const hall=halls.find(h=>String(h.id)===String(id));
+    if(hall) _showHallModal(hall);
+  }
+  function _showHallModal(hall){
     _removeModal('hall-name-modal');
-    const modal = document.createElement('div');
-    modal.id = 'hall-name-modal';
-    modal.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);';
-    modal.innerHTML = `
-      <div style="background:var(--bg-white,#fff);border-radius:20px;padding:1.8rem;max-width:420px;width:94%;direction:rtl;font-family:inherit;box-shadow:0 20px 60px rgba(0,0,0,0.25);">
+    const modal=document.createElement('div');
+    modal.id='hall-name-modal';
+    modal.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);';
+    modal.innerHTML=`
+      <div style="background:var(--bg-white,#fff);border-radius:20px;padding:1.8rem;max-width:440px;width:95%;direction:rtl;font-family:inherit;box-shadow:0 20px 60px rgba(0,0,0,0.25);">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.4rem;">
           <h3 style="margin:0;font-size:1.05rem;font-weight:800;color:var(--primary);">
-            <i class="fas fa-door-open"></i> ${editingHallId ? 'تعديل اسم القاعة' : 'إضافة قاعة جديدة'}
+            <i class="fas fa-door-open"></i> ${editingHallId?'تعديل القاعة':'إضافة قاعة جديدة'}
           </h3>
           <button onclick="document.getElementById('hall-name-modal').remove()"
             style="background:var(--bg-light,#f1f5f9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;">
@@ -463,28 +694,30 @@
           </button>
         </div>
 
-        <label style="display:block;font-size:0.85rem;font-weight:700;margin-bottom:5px;color:var(--text-main);">اسم القاعة</label>
-        <input id="hall-modal-name" type="text" value="${_esc(hall.name || '')}"
-          placeholder="مثال: قاعة 1 — القاعة الكبيرة ..."
-          style="width:100%;padding:0.75rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.95rem;box-sizing:border-box;margin-bottom:1rem;outline:none;"
-          onkeydown="if(event.key==='Enter') HallsModule.saveHallModal()">
+        <label style="display:block;font-size:0.85rem;font-weight:700;margin-bottom:5px;">اسم القاعة *</label>
+        <input id="hall-modal-name" type="text" value="${_esc(hall.name||'')}" placeholder="مثال: قاعة A — القاعة الكبيرة"
+          style="width:100%;padding:0.75rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.95rem;box-sizing:border-box;margin-bottom:1rem;outline:none;">
 
-        <label style="display:block;font-size:0.85rem;font-weight:700;margin-bottom:8px;color:var(--text-main);">لون القاعة</label>
+        <label style="display:block;font-size:0.85rem;font-weight:700;margin-bottom:5px;">السعة القصوى (عدد الطلاب)</label>
+        <input id="hall-modal-capacity" type="number" min="1" value="${_esc(String(hall.capacity||''))}" placeholder="مثال: 50"
+          style="width:100%;padding:0.75rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.95rem;box-sizing:border-box;margin-bottom:1rem;outline:none;">
+
+        <label style="display:block;font-size:0.85rem;font-weight:700;margin-bottom:8px;">لون القاعة</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:1.4rem;">
-          ${HALL_COLORS.map(c => `
-            <div onclick="document.querySelectorAll('.hall-color-dot').forEach(d=>d.style.transform='');this.style.transform='scale(1.2)';this.dataset.sel='1';window._selectedHallColor='${c}'"
+          ${HALL_COLORS.map(c=>`
+            <div onclick="document.querySelectorAll('.hall-color-dot').forEach(d=>d.style.transform='');this.style.transform='scale(1.2)';window._selectedHallColor='${c}'"
               class="hall-color-dot"
-              data-color="${c}"
-              style="width:28px;height:28px;border-radius:50%;background:${c};cursor:pointer;border:2px solid ${c === (hall.color || HALL_COLORS[0]) ? 'white' : 'transparent'};
-                     box-shadow:${c === (hall.color || HALL_COLORS[0]) ? '0 0 0 2px '+c : 'none'};
-                     transform:${c === (hall.color || HALL_COLORS[0]) ? 'scale(1.2)' : ''};transition:all 0.15s;">
+              style="width:28px;height:28px;border-radius:50%;background:${c};cursor:pointer;
+                border:2px solid ${c===(hall.color||HALL_COLORS[0])?'white':'transparent'};
+                box-shadow:${c===(hall.color||HALL_COLORS[0])?'0 0 0 2px '+c:'none'};
+                transform:${c===(hall.color||HALL_COLORS[0])?'scale(1.2)':''};transition:all 0.15s;">
             </div>`).join('')}
         </div>
 
         <div style="display:flex;gap:0.75rem;">
           <button onclick="HallsModule.saveHallModal()"
-            style="flex:1;padding:0.8rem;border:none;border-radius:10px;background:var(--primary);color:white;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.9rem;">
-            <i class="fas fa-save"></i> ${editingHallId ? 'حفظ التعديل' : 'إضافة القاعة'}
+            style="flex:1;padding:0.8rem;border:none;border-radius:10px;background:var(--primary);color:white;font-weight:700;cursor:pointer;font-family:inherit;">
+            <i class="fas fa-save"></i> ${editingHallId?'حفظ التعديل':'إضافة القاعة'}
           </button>
           <button onclick="document.getElementById('hall-name-modal').remove()"
             style="padding:0.8rem 1rem;border:none;border-radius:10px;background:var(--bg-light,#f1f5f9);cursor:pointer;font-family:inherit;">
@@ -493,379 +726,351 @@
         </div>
       </div>`;
     document.body.appendChild(modal);
-    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
-
-    // تعيين اللون الافتراضي
-    window._selectedHallColor = hall.color || HALL_COLORS[0];
-    setTimeout(() => document.getElementById('hall-modal-name')?.focus(), 100);
+    modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+    window._selectedHallColor=hall.color||HALL_COLORS[0];
+    setTimeout(()=>document.getElementById('hall-modal-name')?.focus(),80);
   }
 
-  async function saveHallModal() {
-    const name  = document.getElementById('hall-modal-name')?.value.trim();
-    const color = window._selectedHallColor || HALL_COLORS[0];
-    if (!name) return notify('يرجى كتابة اسم للقاعة', 'error');
+  async function saveHallModal(){
+    const name=document.getElementById('hall-modal-name')?.value.trim();
+    const capacity=parseInt(document.getElementById('hall-modal-capacity')?.value)||0;
+    const color=window._selectedHallColor||HALL_COLORS[0];
+    if(!name) return notify('يرجى كتابة اسم للقاعة','error');
 
-    if (editingHallId) {
-      const hall = halls.find(h => String(h.id) === String(editingHallId));
-      if (!hall) return;
-      hall.name  = name;
-      hall.color = color;
-      await saveHall(hall);
+    if(editingHallId){
+      const hall=halls.find(h=>String(h.id)===String(editingHallId));
+      if(!hall) return;
+      hall.name=name; hall.capacity=capacity; hall.color=color;
+      await _save('halls',hall);
       notify('✅ تم تحديث بيانات القاعة');
     } else {
-      const hall = { id: Date.now(), name, color, createdAt: new Date().toISOString() };
+      const hall={id:Date.now(),name,capacity,color,createdAt:new Date().toISOString()};
       halls.push(hall);
-      await saveHall(hall);
+      await _save('halls',hall);
       notify('✅ تمت إضافة القاعة بنجاح');
     }
-
     _removeModal('hall-name-modal');
     renderHallsSection();
-    if (activeHallId) renderHallDetail(activeHallId);
   }
 
-  async function deleteHall(hallId) {
-    const hall = halls.find(h => String(h.id) === String(hallId));
-    if (!hall) return;
-    const hallBookings = bookings.filter(b => String(b.hallId) === String(hallId));
-    const msg = hallBookings.length
-      ? `حذف "${hall.name}" وكل حجوزاتها (${hallBookings.length} حجز)؟ لا يمكن التراجع.`
-      : `حذف قاعة "${hall.name}"؟`;
-    if (!confirm(msg)) return;
-
-    // حذف الحجوزات
-    for (const b of hallBookings) {
-      await deleteBookingDB(b.id);
-    }
-    bookings = bookings.filter(b => String(b.hallId) !== String(hallId));
-
-    await deleteHallDB(hall.id);
-    halls = halls.filter(h => String(h.id) !== String(hallId));
-
-    if (String(activeHallId) === String(hallId)) closeHallDetail();
-    notify('تم حذف القاعة وكل حجوزاتها');
+  async function deleteHall(id){
+    const hall=halls.find(h=>String(h.id)===String(id));
+    if(!hall) return;
+    const count=lessons.filter(l=>String(l.hallId)===String(id)).length;
+    if(!confirm(`حذف "${hall.name}"${count?` وكل حصصها (${count} حصة)`:''}؟`)) return;
+    for(const l of lessons.filter(x=>String(x.hallId)===String(id))) await _del('lessons',l.id);
+    lessons=lessons.filter(l=>String(l.hallId)!==String(id));
+    await _del('halls',id);
+    halls=halls.filter(h=>String(h.id)!==String(id));
+    notify('تم حذف القاعة');
     renderHallsSection();
   }
 
-  /* ══════════════════════════════════════════════════════════
-     مودال إضافة / تعديل حجز
-  ══════════════════════════════════════════════════════════ */
-  function openAddBookingModal(hallId, presetDay = '') {
-    editingBookingId = null;
-    const hall = halls.find(h => String(h.id) === String(hallId));
-    _showBookingModal({
-      hallId,
-      day: presetDay || '',
-      timeFrom: '',
-      timeTo: '',
-      grade: window.currentGrade || '',
-      groupId: window.currentGroupId || '',
-      notes: ''
-    }, hall);
+  // ══════════════════════════════════════════════════════════
+  //  LESSON MODAL (Add/Edit) — Central Schedule
+  // ══════════════════════════════════════════════════════════
+  function openAddLessonModal(hallId='', presetDay=''){
+    editingLessonId=null;
+    _showLessonModal({hallId:hallId||'',day:presetDay,timeFrom:'',timeTo:'',teacherId:'',subject:'',grade:'',groupId:'',notes:''});
+  }
+  function openEditLessonModal(id){
+    editingLessonId=id;
+    const l=lessons.find(x=>String(x.id)===String(id));
+    if(l) _showLessonModal(l);
   }
 
-  function openEditBookingModal(bookingId) {
-    editingBookingId = bookingId;
-    const b = bookings.find(x => String(x.id) === String(bookingId));
-    if (!b) return;
-    const hall = halls.find(h => String(h.id) === String(b.hallId));
-    _showBookingModal(b, hall);
-  }
-
-  function _showBookingModal(b, hall) {
-    _removeModal('hall-booking-modal');
-    const color = hall ? hallColor(hall) : 'var(--primary)';
-    const hallName = hall ? hall.name : '';
-
-    const modal = document.createElement('div');
-    modal.id = 'hall-booking-modal';
-    modal.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);';
-    modal.innerHTML = `
-      <div style="background:var(--bg-white,#fff);border-radius:20px;padding:1.8rem;max-width:500px;width:96%;max-height:90vh;overflow-y:auto;direction:rtl;font-family:inherit;box-shadow:0 20px 60px rgba(0,0,0,0.28);">
-
+  function _showLessonModal(l){
+    _removeModal('lesson-modal');
+    const modal=document.createElement('div');
+    modal.id='lesson-modal';
+    modal.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);overflow-y:auto;';
+    modal.innerHTML=`
+      <div style="background:var(--bg-white,#fff);border-radius:20px;padding:1.8rem;max-width:540px;width:96%;max-height:92vh;overflow-y:auto;direction:rtl;font-family:inherit;box-shadow:0 20px 60px rgba(0,0,0,0.28);margin:auto;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.4rem;">
-          <h3 style="margin:0;font-size:1.05rem;font-weight:800;color:${color};">
-            <i class="fas fa-calendar-plus"></i>
-            ${editingBookingId ? 'تعديل الحجز' : 'حجز جديد'}
-            ${hallName ? `<span style="color:var(--text-muted);font-weight:500;font-size:0.85rem;"> — ${_esc(hallName)}</span>` : ''}
+          <h3 style="margin:0;font-size:1.05rem;font-weight:800;color:var(--primary);">
+            <i class="fas fa-calendar-plus"></i> ${editingLessonId?'تعديل الحصة':'إضافة حصة جديدة'}
           </h3>
-          <button onclick="document.getElementById('hall-booking-modal').remove()"
+          <button onclick="document.getElementById('lesson-modal').remove()"
             style="background:var(--bg-light,#f1f5f9);border:none;border-radius:50%;width:32px;height:32px;cursor:pointer;">
             <i class="fas fa-times"></i>
           </button>
         </div>
 
-        <!-- اليوم -->
-        <div style="margin-bottom:1rem;">
-          <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">📅 اليوم</label>
-          <select id="bk-day"
-            style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;background:var(--bg-white);">
-            <option value="">-- اختر اليوم --</option>
-            ${DAY_KEYS.map((dk, i) =>
-              `<option value="${dk}" ${dk === b.day ? 'selected' : ''}>${ARABIC_DAYS[i]}</option>`
-            ).join('')}
-          </select>
+        <!-- Row: Teacher + Subject -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:1rem;">
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">👤 المدرس</label>
+            <select id="ls-teacher"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
+              ${buildTeacherOptions(l.teacherId)}
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">📚 المادة</label>
+            <input id="ls-subject" type="text" value="${_esc(l.subject||'')}" placeholder="مثال: الفيزياء"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;box-sizing:border-box;">
+          </div>
         </div>
 
-        <!-- الوقت -->
+        <!-- Row: Grade + Group -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:1rem;">
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">🎓 المرحلة/الصف</label>
+            <select id="ls-grade" onchange="HallsModule._onLsGradeChange()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
+              <option value="">-- اختر الصف --</option>
+              ${buildGradeOptions(l.grade)}
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">👥 المجموعة</label>
+            <select id="ls-group" onchange="HallsModule._onLsGroupChange()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
+              ${buildGroupOptions(l.grade,l.groupId)}
+            </select>
+          </div>
+        </div>
+
+        <!-- Row: Hall + Day -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:1rem;">
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">🏫 القاعة</label>
+            <select id="ls-hall" onchange="HallsModule._onLsHallChange()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
+              ${buildHallOptions(l.hallId)}
+            </select>
+          </div>
+          <div>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">📅 اليوم</label>
+            <select id="ls-day" onchange="HallsModule._lsCheckConflicts()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
+              <option value="">-- اختر اليوم --</option>
+              ${DAY_KEYS.map((dk,i)=>`<option value="${dk}" ${dk===l.day?'selected':''}>${ARABIC_DAYS[i]}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <!-- Row: Time -->
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;margin-bottom:1rem;">
           <div>
             <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">🕐 من</label>
-            <input id="bk-from" type="time" value="${_esc(b.timeFrom || '')}"
-              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;box-sizing:border-box;">
+            <input id="ls-from" type="time" value="${_esc(l.timeFrom||'')}" onchange="HallsModule._lsCheckConflicts()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;box-sizing:border-box;">
           </div>
           <div>
             <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">🕕 إلى</label>
-            <input id="bk-to" type="time" value="${_esc(b.timeTo || '')}"
-              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;box-sizing:border-box;">
+            <input id="ls-to" type="time" value="${_esc(l.timeTo||'')}" onchange="HallsModule._lsCheckConflicts()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;box-sizing:border-box;">
           </div>
         </div>
 
-        <!-- الصف -->
-        <div style="margin-bottom:1rem;">
-          <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">🎓 الصف / المرحلة الدراسية</label>
-          <select id="bk-grade" onchange="HallsModule._updateGroupOptions()"
-            style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;background:var(--bg-white);">
-            <option value="">-- اختر الصف --</option>
-            ${buildGradeOptions(b.grade)}
-          </select>
+        <!-- Conflict Zone -->
+        <div id="ls-conflicts" style="display:none;margin-bottom:1rem;"></div>
+
+        <!-- Capacity Warning -->
+        <div id="ls-capacity-warn" style="display:none;background:#fef3c7;border:1.5px solid #fbbf24;border-radius:10px;padding:0.7rem 1rem;margin-bottom:1rem;font-size:0.83rem;color:#92400e;">
+          <i class="fas fa-exclamation-triangle"></i> <span id="ls-capacity-msg"></span>
         </div>
 
-        <!-- المجموعة -->
-        <div style="margin-bottom:1rem;">
-          <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">👥 المجموعة</label>
-          <select id="bk-group"
-            style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;background:var(--bg-white);">
-            ${buildGroupOptions(b.grade, b.groupId)}
-          </select>
-        </div>
-
-        <!-- ملاحظات -->
+        <!-- Notes -->
         <div style="margin-bottom:1.4rem;">
           <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">📝 ملاحظات (اختياري)</label>
-          <input id="bk-notes" type="text" value="${_esc(b.notes || '')}" placeholder="أي ملاحظة إضافية..."
-            style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.9rem;box-sizing:border-box;">
-        </div>
-
-        <!-- مؤشر التعارض -->
-        <div id="conflict-indicator" style="display:none;background:#fef2f2;border:1.5px solid #fca5a5;border-radius:10px;padding:0.75rem 1rem;margin-bottom:1rem;color:#991b1b;font-size:0.85rem;">
-          <i class="fas fa-exclamation-triangle"></i> <span id="conflict-msg"></span>
+          <input id="ls-notes" type="text" value="${_esc(l.notes||'')}" placeholder="أي ملاحظة إضافية..."
+            style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;box-sizing:border-box;">
         </div>
 
         <div style="display:flex;gap:0.75rem;">
-          <button onclick="HallsModule.saveBookingModal('${b.hallId || ''}')"
-            style="flex:1;padding:0.8rem;border:none;border-radius:10px;background:${color};color:white;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.9rem;">
-            <i class="fas fa-save"></i> ${editingBookingId ? 'حفظ التعديل' : 'حفظ الحجز'}
+          <button onclick="HallsModule.saveLessonModal()"
+            style="flex:1;padding:0.8rem;border:none;border-radius:10px;background:var(--primary);color:white;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.9rem;">
+            <i class="fas fa-save"></i> ${editingLessonId?'حفظ التعديل':'حفظ الحصة'}
           </button>
-          <button onclick="document.getElementById('hall-booking-modal').remove()"
+          <button onclick="document.getElementById('lesson-modal').remove()"
             style="padding:0.8rem 1rem;border:none;border-radius:10px;background:var(--bg-light,#f1f5f9);cursor:pointer;font-family:inherit;">
             إلغاء
           </button>
         </div>
       </div>`;
-
     document.body.appendChild(modal);
-    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+    modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+    setTimeout(()=>document.getElementById('ls-teacher')?.focus(),80);
+  }
 
-    // تفعيل الكشف اللحظي عن التعارض
-    const checkConflict = () => {
-      const day     = document.getElementById('bk-day')?.value;
-      const tf      = document.getElementById('bk-from')?.value;
-      const tt      = document.getElementById('bk-to')?.value;
-      const ind     = document.getElementById('conflict-indicator');
-      const msgEl   = document.getElementById('conflict-msg');
-      if (!day || !tf || !tt || !ind) return;
-
-      if (toMinutes(tt) <= toMinutes(tf)) {
-        ind.style.display = 'block';
-        msgEl.textContent = 'وقت النهاية يجب أن يكون بعد وقت البداية';
-        return;
-      }
-
-      const result = detectConflict(b.hallId, day, tf, tt, editingBookingId);
-      if (result.conflict) {
-        const cw = result.with;
-        const dayL = ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)] || cw.day;
-        ind.style.display = 'block';
-        msgEl.textContent = `تعارض مع حجز موجود: ${dayL} من ${cw.timeFrom} إلى ${cw.timeTo} (${gradeName(cw.grade)} · ${groupName(cw.groupId)})`;
+  function _onLsGradeChange(){
+    const grade=document.getElementById('ls-grade')?.value||'';
+    const sel=document.getElementById('ls-group');
+    if(sel) sel.innerHTML=buildGroupOptions(grade,'');
+    _onLsGroupChange();
+  }
+  function _onLsGroupChange(){
+    const hallId=document.getElementById('ls-hall')?.value||'';
+    const groupId=document.getElementById('ls-group')?.value||'';
+    if(!hallId||!groupId) return;
+    const cap=checkCapacity(hallId,groupId);
+    const warn=document.getElementById('ls-capacity-warn');
+    const msg=document.getElementById('ls-capacity-msg');
+    if(warn&&msg){
+      if(cap.over){
+        warn.style.display='block';
+        msg.textContent=`تحذير: عدد طلاب المجموعة (${cap.count}) يتجاوز سعة القاعة (${cap.cap} طالب). لن يُسمح بالحجز إلا بموافقة المشرف.`;
       } else {
-        ind.style.display = 'none';
+        warn.style.display='none';
       }
-    };
-
-    setTimeout(() => {
-      document.getElementById('bk-day')?.addEventListener('change', checkConflict);
-      document.getElementById('bk-from')?.addEventListener('change', checkConflict);
-      document.getElementById('bk-to')?.addEventListener('change', checkConflict);
-    }, 50);
+    }
   }
+  function _onLsHallChange(){ _lsCheckConflicts(); _onLsGroupChange(); }
 
-  // تحديث خيارات المجموعة عند تغيير الصف
-  function _updateGroupOptions() {
-    const gradeId = document.getElementById('bk-grade')?.value || '';
-    const sel = document.getElementById('bk-group');
-    if (sel) sel.innerHTML = buildGroupOptions(gradeId, '');
-  }
+  function _lsCheckConflicts(){
+    const hallId=document.getElementById('ls-hall')?.value;
+    const teacherId=document.getElementById('ls-teacher')?.value;
+    const day=document.getElementById('ls-day')?.value;
+    const from=document.getElementById('ls-from')?.value;
+    const to=document.getElementById('ls-to')?.value;
+    const zone=document.getElementById('ls-conflicts');
+    if(!zone) return;
 
-  async function saveBookingModal(hallId) {
-    const day     = document.getElementById('bk-day')?.value;
-    const timeFrom = document.getElementById('bk-from')?.value;
-    const timeTo   = document.getElementById('bk-to')?.value;
-    const grade    = document.getElementById('bk-grade')?.value || '';
-    const groupId  = document.getElementById('bk-group')?.value || '';
-    const notes    = document.getElementById('bk-notes')?.value.trim() || '';
+    const msgs=[];
 
-    if (!day)     return notify('يرجى اختيار اليوم', 'error');
-    if (!timeFrom) return notify('يرجى تحديد وقت البداية', 'error');
-    if (!timeTo)   return notify('يرجى تحديد وقت النهاية', 'error');
-    if (toMinutes(timeTo) <= toMinutes(timeFrom))
-      return notify('وقت النهاية يجب أن يكون بعد وقت البداية', 'error');
-
-    // ── كشف التعارض قبل الحفظ ──
-    const targetHallId = editingBookingId
-      ? bookings.find(b => String(b.id) === String(editingBookingId))?.hallId
-      : hallId;
-    const conflict = detectConflict(targetHallId, day, timeFrom, timeTo, editingBookingId);
-    if (conflict.conflict) {
-      const cw   = conflict.with;
-      const dayL = ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)] || cw.day;
-      return notify(
-        `❌ تعارض في الحجز! القاعة محجوزة ${dayL} من ${cw.timeFrom} إلى ${cw.timeTo} لـ ${gradeName(cw.grade)}`,
-        'error'
-      );
+    if(day&&from&&to){
+      if(toMin(to)<=toMin(from)){
+        msgs.push({text:'⚠️ وقت النهاية يجب أن يكون بعد وقت البداية',color:'#fef2f2',border:'#fca5a5',txt:'#991b1b'});
+      } else {
+        if(hallId){
+          const hc=detectHallConflict(hallId,day,from,to,editingLessonId);
+          if(hc.conflict){
+            const cw=hc.with;
+            msgs.push({text:`❌ تعارض في القاعة: ${ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)]} ${cw.timeFrom}–${cw.timeTo} (${teacherName(cw.teacherId)})`,color:'#fef2f2',border:'#fca5a5',txt:'#991b1b'});
+          }
+        }
+        if(teacherId){
+          const tc=detectTeacherConflict(teacherId,day,from,to,editingLessonId);
+          if(tc.conflict){
+            const cw=tc.with;
+            msgs.push({text:`❌ تعارض مع جدول المدرس: ${ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)]} ${cw.timeFrom}–${cw.timeTo} في ${halls.find(h=>String(h.id)===String(cw.hallId))?.name||'---'}`,color:'#fef2f2',border:'#fca5a5',txt:'#991b1b'});
+          }
+        }
+      }
     }
 
-    if (editingBookingId) {
-      const b = bookings.find(x => String(x.id) === String(editingBookingId));
-      if (!b) return;
-      Object.assign(b, { day, timeFrom, timeTo, grade, groupId, notes });
-      await saveBooking(b);
-      notify('✅ تم تحديث الحجز');
+    if(msgs.length>0){
+      zone.style.display='block';
+      zone.innerHTML=msgs.map(m=>`
+        <div style="background:${m.color};border:1.5px solid ${m.border};border-radius:10px;padding:0.65rem 1rem;margin-bottom:0.4rem;color:${m.txt};font-size:0.83rem;">
+          ${m.text}
+        </div>`).join('');
     } else {
-      const b = {
-        id: Date.now(),
-        hallId: targetHallId,
-        day, timeFrom, timeTo, grade, groupId, notes,
-        createdAt: new Date().toISOString()
-      };
-      bookings.push(b);
-      await saveBooking(b);
-      notify('✅ تم إضافة الحجز بنجاح');
+      zone.style.display='none';
+      zone.innerHTML='';
+    }
+  }
+
+  async function saveLessonModal(){
+    const hallId=document.getElementById('ls-hall')?.value;
+    const teacherId=document.getElementById('ls-teacher')?.value||'';
+    const subject=document.getElementById('ls-subject')?.value.trim()||'';
+    const grade=document.getElementById('ls-grade')?.value||'';
+    const groupId=document.getElementById('ls-group')?.value||'';
+    const day=document.getElementById('ls-day')?.value;
+    const timeFrom=document.getElementById('ls-from')?.value;
+    const timeTo=document.getElementById('ls-to')?.value;
+    const notes=document.getElementById('ls-notes')?.value.trim()||'';
+
+    if(!day) return notify('يرجى اختيار اليوم','error');
+    if(!timeFrom) return notify('يرجى تحديد وقت البداية','error');
+    if(!timeTo) return notify('يرجى تحديد وقت النهاية','error');
+    if(toMin(timeTo)<=toMin(timeFrom)) return notify('وقت النهاية يجب أن يكون بعد وقت البداية','error');
+
+    const errors=[];
+
+    if(hallId){
+      const hc=detectHallConflict(hallId,day,timeFrom,timeTo,editingLessonId);
+      if(hc.conflict){
+        const cw=hc.with;
+        errors.push(`تعارض في القاعة: ${ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)]} ${cw.timeFrom}–${cw.timeTo} (${teacherName(cw.teacherId)})`);
+      }
+    }
+    if(teacherId){
+      const tc=detectTeacherConflict(teacherId,day,timeFrom,timeTo,editingLessonId);
+      if(tc.conflict){
+        const cw=tc.with;
+        errors.push(`تعارض مع جدول المدرس: ${ARABIC_DAYS[DAY_KEYS.indexOf(cw.day)]} ${cw.timeFrom}–${cw.timeTo}`);
+      }
+    }
+    if(hallId&&groupId){
+      const cap=checkCapacity(hallId,groupId);
+      if(cap.over) errors.push(`عدد طلاب المجموعة (${cap.count}) يتجاوز سعة القاعة (${cap.cap})`);
     }
 
-    _removeModal('hall-booking-modal');
+    if(errors.length>0) return notify('❌ '+errors.join(' | '),'error');
+
+    if(editingLessonId){
+      const lesson=lessons.find(x=>String(x.id)===String(editingLessonId));
+      if(!lesson) return;
+      Object.assign(lesson,{hallId:hallId||null,teacherId:teacherId||null,subject,grade,groupId:groupId||null,day,timeFrom,timeTo,notes});
+      await _save('lessons',lesson);
+      notify('✅ تم تحديث الحصة');
+    } else {
+      const lesson={id:Date.now(),hallId:hallId||null,teacherId:teacherId||null,subject,grade,groupId:groupId||null,day,timeFrom,timeTo,notes,createdAt:new Date().toISOString()};
+      lessons.push(lesson);
+      await _save('lessons',lesson);
+      notify('✅ تمت إضافة الحصة');
+    }
+
+    _removeModal('lesson-modal');
     renderHallsSection();
-    if (activeHallId) renderHallDetail(activeHallId);
+    if(activeHallId) setTimeout(()=>openHallDetail(activeHallId),50);
   }
 
-  async function deleteBooking(bookingId) {
-    const b = bookings.find(x => String(x.id) === String(bookingId));
-    if (!b) return;
-    const dayL = ARABIC_DAYS[DAY_KEYS.indexOf(b.day)] || b.day;
-    if (!confirm(`حذف هذا الحجز؟\n${dayL} · ${b.timeFrom} — ${b.timeTo} · ${gradeName(b.grade)}`)) return;
-
-    await deleteBookingDB(b.id);
-    bookings = bookings.filter(x => String(x.id) !== String(bookingId));
-    notify('تم حذف الحجز');
+  async function deleteLesson(id){
+    const l=lessons.find(x=>String(x.id)===String(id));
+    if(!l) return;
+    const dayL=ARABIC_DAYS[DAY_KEYS.indexOf(l.day)]||l.day;
+    if(!confirm(`حذف هذه الحصة؟\n${dayL} · ${l.timeFrom}–${l.timeTo} · ${teacherName(l.teacherId)}`)) return;
+    await _del('lessons',l.id);
+    lessons=lessons.filter(x=>String(x.id)!==String(id));
+    notify('تم حذف الحصة');
     renderHallsSection();
-    if (activeHallId) renderHallDetail(activeHallId);
+    if(activeHallId) setTimeout(()=>openHallDetail(activeHallId),50);
   }
 
-  /* ══════════════════════════════════════════════════════════
-     مساعد إزالة المودال
-  ══════════════════════════════════════════════════════════ */
-  function _removeModal(id) {
-    const el = document.getElementById(id);
-    if (el) el.remove();
-  }
+  // ── Helper: remove modal ──
+  function _removeModal(id){ const el=document.getElementById(id); if(el) el.remove(); }
 
-  /* ══════════════════════════════════════════════════════════
-     نقطة الدخول الرئيسية — تُستدعى من showSection
-  ══════════════════════════════════════════════════════════ */
-  async function initHallsSection() {
+  // ── Entry point ──
+  async function initHallsSection(){
     await loadData();
     renderHallsSection();
   }
 
-  /* ══════════════════════════════════════════════════════════
-     حقن عنصر التنقل وقسم HTML في صفحة app.js
-  ══════════════════════════════════════════════════════════ */
-  function ensureHallsNav() {
-    if (document.getElementById('nav-halls')) return;
-    const nav = document.querySelector('.nav-links');
-    if (!nav) return;
-
-    const item = document.createElement('li');
-    item.className = 'nav-item';
-    item.innerHTML = `
-      <a href="#" class="nav-link" id="nav-halls" onclick="showSection('halls', this)">
-        <i class="fas fa-building" style="color:#8b5cf6;"></i>
-        <span>القاعات</span>
-      </a>`;
-
-    // أضفه قبل قسم «الإعدادات» أو في آخر القائمة
-    const settingsItem = document.getElementById('nav-settings')?.closest('.nav-item');
-    nav.insertBefore(item, settingsItem || nav.lastElementChild);
+  // ── Ensure nav and section exist ──
+  function ensureHallsSection(){
+    if(document.getElementById('halls-section')) return;
+    // Section is already in index.html, just need halls-content
   }
+  function ensureHallsNav(){ /* nav is in index.html */ }
 
-  function ensureHallsSection() {
-    if (document.getElementById('halls-section')) return;
-    const main = document.querySelector('.main-content');
-    if (!main) return;
-
-    const section = document.createElement('section');
-    section.id = 'halls-section';
-    section.className = 'fade-in';
-    section.style.display = 'none';
-    section.innerHTML = `
-      <!-- ── هيدر القسم ── -->
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem;">
-        <div>
-          <h2 style="margin:0;font-size:1.3rem;font-weight:800;color:var(--text-main);">
-            <i class="fas fa-building" style="color:#8b5cf6;margin-left:8px;"></i> إدارة القاعات الدراسية
-          </h2>
-          <p style="margin:4px 0 0;font-size:0.85rem;color:var(--text-muted);">
-            جدولة القاعات مع كشف التعارض التلقائي
-          </p>
-        </div>
-        <button onclick="HallsModule.openAddHallModal()"
-          style="padding:0.7rem 1.4rem;background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:white;border:none;border-radius:12px;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.9rem;box-shadow:0 4px 12px rgba(139,92,246,0.3);">
-          <i class="fas fa-plus"></i> قاعة جديدة
-        </button>
-      </div>
-
-      <!-- ── المحتوى الديناميكي ── -->
-      <div id="halls-content"></div>`;
-
-    main.appendChild(section);
-  }
-
-  /* ══════════════════════════════════════════════════════════
-     تصدير API عام
-  ══════════════════════════════════════════════════════════ */
+  // ── Public API ──
   window.HallsModule = {
     init: initHallsSection,
+    ensureUI(){ ensureHallsNav(); ensureHallsSection(); },
     openAddHallModal,
     openEditHallModal,
     saveHallModal,
     deleteHall,
-    openHallDetail: (id) => { renderHallDetail(id); },
-    closeHallDetail,
-    openAddBookingModal,
-    openEditBookingModal,
-    saveBookingModal,
-    deleteBooking,
-    _updateGroupOptions,
-    ensureUI() {
-      ensureHallsNav();
-      ensureHallsSection();
-    }
+    openHallDetail,
+    openAddLessonModal,
+    openEditLessonModal,
+    saveLessonModal,
+    deleteLesson,
+    showTab,
+    _filterDay,
+    _onLsGradeChange,
+    _onLsGroupChange,
+    _onLsHallChange,
+    _lsCheckConflicts,
+    // Expose lessons for TeachersModule
+    getLessons: ()=>lessons,
+    getHalls: ()=>halls,
   };
 
-  // ── تسجيل تلقائي عند تحميل الصفحة ──
-  document.addEventListener('DOMContentLoaded', () => {
-    HallsModule.ensureUI();
-    console.log('[halls.js] ✅ نظام القاعات جاهز');
-  });
-
+  document.addEventListener('DOMContentLoaded',()=>{ console.log('[halls.js] v2.0 ✅ جاهز'); });
 })();

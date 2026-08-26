@@ -304,7 +304,7 @@ const StorageEngine = {
             //  attendance / payments تشير إلى enrollmentId وليس groupId فقط.
             // ─────────────────────────────────────────────────────────────
             // v9: إضافة جدولَي canteenItems و canteenSales لنظام الكانتين
-            const request = indexedDB.open("EduMasterLargeDB", 9);
+            const request = indexedDB.open("EduMasterLargeDB", 10);
             request.onerror = (e) => reject("IndexedDB error: " + e.target.errorCode);
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -336,6 +336,20 @@ const StorageEngine = {
                     const hbStore = db.createObjectStore("hallBookings", { keyPath: "id" });
                     hbStore.createIndex("hallId", "hallId", { unique: false });
                     hbStore.createIndex("day",    "day",    { unique: false });
+                }
+
+                // ── جدول الحصص المركزية ──
+                if (!db.objectStoreNames.contains("lessons")) {
+                    const lsStore = db.createObjectStore("lessons", { keyPath: "id" });
+                    lsStore.createIndex("teacherId", "teacherId", { unique: false });
+                    lsStore.createIndex("hallId",    "hallId",    { unique: false });
+                    lsStore.createIndex("day",       "day",       { unique: false });
+                }
+
+                // ── جدول سلف المدرسين ──
+                if (!db.objectStoreNames.contains("teacherAdvances")) {
+                    const taStore = db.createObjectStore("teacherAdvances", { keyPath: "id" });
+                    taStore.createIndex("teacherId", "teacherId", { unique: false });
                 }
 
                 // ── جدول أصناف الكانتين ──
@@ -11958,7 +11972,7 @@ const DEVICE_SYNC_FULL_TABLES = [
     'staff', 'shifts', 'courseCodes', 'platformCourses', 'platformSubscriptions',
     'secretaries',
     'teachers', 'teacherSessions', 'teacherLogs', 'teacherPayouts',
-    'halls', 'hallBookings', 'canteenItems', 'canteenSales'
+    'halls', 'hallBookings', 'lessons', 'teacherAdvances', 'canteenItems', 'canteenSales'
 ];
 
 // ============================================================

@@ -2920,6 +2920,30 @@
             </div>
         </section>
 
+
+        <!-- ══ قسم القاعات الدراسية ══ -->
+        <section id="halls-section" style="display:none;" class="fade-in">
+            <div style="padding:0 0 2rem;">
+                <!-- Header -->
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem;">
+                    <div>
+                        <h2 style="margin:0;font-size:1.3rem;font-weight:800;color:var(--text-main);">
+                            <i class="fas fa-building" style="color:#8b5cf6;margin-left:8px;"></i> إدارة القاعات الدراسية
+                        </h2>
+                        <p style="margin:4px 0 0;font-size:0.85rem;color:var(--text-muted);">
+                            جدولة الحصص مع كشف التعارض التلقائي ومتابعة المدرسين
+                        </p>
+                    </div>
+                    <button onclick="HallsModule.openAddHallModal()"
+                        style="padding:0.7rem 1.4rem;background:linear-gradient(135deg,#8b5cf6,#6d28d9);color:white;border:none;border-radius:12px;font-weight:700;cursor:pointer;font-family:inherit;font-size:0.9rem;box-shadow:0 4px 12px rgba(139,92,246,0.3);">
+                        <i class="fas fa-plus"></i> قاعة جديدة
+                    </button>
+                </div>
+                <!-- Dynamic Content -->
+                <div id="halls-content"></div>
+            </div>
+        </section>
+
     </main>
 
     <!-- Student Entry Modal -->
@@ -4265,9 +4289,9 @@
         <script src="transfer-student.js?v=1"></script>
         <script src="receive-exams.js?v=1"></script>
         <script src="ai-exam-builder.js?v=1"></script>
-        <script src="teachers.js?v=1"></script>
+        <script src="teachers.js?v=2"></script>
         <script src="teachers-attendance.js?v=1"></script>
-        <script src="halls.js?v=1"></script>
+        <script src="halls.js?v=2"></script>
         <script src="canteen.js?v=1"></script>
         <!-- ملاحظة: تم إيقاف تحميل device-sync.js — كان يحتوي على نسخة قديمة ومختصرة
              من دوال المزامنة (رفع/استلام الطلاب والمدفوعات فقط، بدون باقي جداول
