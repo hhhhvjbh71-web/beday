@@ -2424,214 +2424,6 @@ function initFilters() {
 }
 
 // --- 2. Students & Groups Logic ---
-
-// ══════════════════════════════════════════════════════════════
-//  إدارة وضع الكود (تلقائي / يدوي / سكانر)
-// ══════════════════════════════════════════════════════════════
-
-let _codeMode = 'auto'; // 'auto' | 'manual'
-let _codeScannerActive = false;
-let _codeScannerBuffer = '';
-let _codeScannerTimer = null;
-
-/**
- * يُعيد ضبط واجهة الكود إلى الوضع التلقائي
- */
-function resetCodeMode() {
-    _codeMode = 'auto';
-    stopCodeScanner();
-    const manualInput = document.getElementById('std-manual-code');
-    if (manualInput) manualInput.value = '';
-    const preview = document.getElementById('manual-code-preview');
-    if (preview) preview.textContent = '';
-    _applyCodeModeUI();
-}
-
-/**
- * يُطبّق مظهر الأزرار والأقسام حسب الوضع الحالي
- */
-function _applyCodeModeUI() {
-    const btnAuto   = document.getElementById('btn-code-auto');
-    const btnManual = document.getElementById('btn-code-manual');
-    const manualSec = document.getElementById('manual-code-section');
-    const autoPrev  = document.getElementById('auto-code-preview');
-    if (!btnAuto) return;
-
-    if (_codeMode === 'auto') {
-        btnAuto.style.background   = 'var(--primary)';
-        btnAuto.style.color        = '#fff';
-        btnManual.style.background = 'transparent';
-        btnManual.style.color      = 'var(--primary)';
-        manualSec.style.display    = 'none';
-        autoPrev.style.display     = 'block';
-    } else {
-        btnManual.style.background = 'var(--primary)';
-        btnManual.style.color      = '#fff';
-        btnAuto.style.background   = 'transparent';
-        btnAuto.style.color        = 'var(--primary)';
-        manualSec.style.display    = 'block';
-        autoPrev.style.display     = 'none';
-    }
-}
-
-/**
- * يُغيّر وضع الكود بضغطة زر
- * @param {'auto'|'manual'} mode
- */
-function setCodeMode(mode) {
-    _codeMode = mode;
-    if (mode === 'auto') {
-        stopCodeScanner();
-        const manualInput = document.getElementById('std-manual-code');
-        if (manualInput) manualInput.value = '';
-        const preview = document.getElementById('manual-code-preview');
-        if (preview) preview.textContent = '';
-    }
-    _applyCodeModeUI();
-    if (mode === 'manual') {
-        setTimeout(() => {
-            const inp = document.getElementById('std-manual-code');
-            if (inp) inp.focus();
-        }, 100);
-    }
-}
-
-/**
- * يُحدّث معاينة الكود اليدوي أثناء الكتابة
- */
-function onManualCodeInput(val) {
-    const preview = document.getElementById('manual-code-preview');
-    if (!preview) return;
-    const clean = val.trim();
-    if (!clean) {
-        preview.textContent = '';
-        return;
-    }
-    // التحقق من التكرار
-    const exists = db.students.some(s => String(s.qrCode) === clean);
-    if (exists) {
-        preview.innerHTML = '<span style="color:var(--danger)"><i class="fas fa-exclamation-circle"></i> هذا الكود مستخدم مسبقًا</span>';
-    } else {
-        preview.innerHTML = '<span style="color:var(--success)"><i class="fas fa-check-circle"></i> الكود متاح: <b style="font-family:monospace">' + clean + '</b></span>';
-    }
-}
-
-/**
- * تشغيل وضع السكانر: يستمع لمدخلات لوحة المفاتيح السريعة (الباركود سكانر)
- */
-function startCodeScanner() {
-    _codeScannerActive = true;
-    _codeScannerBuffer = '';
-    const scannerStatus = document.getElementById('scanner-status');
-    const scannerBtn    = document.getElementById('btn-scan-code');
-    if (scannerStatus) scannerStatus.style.display = 'block';
-    if (scannerBtn) {
-        scannerBtn.style.background = 'var(--danger)';
-        scannerBtn.innerHTML = '<i class="fas fa-times"></i>';
-        scannerBtn.onclick = stopCodeScanner;
-    }
-    // إخفاء حقل الكتابة مؤقتاً
-    const manualInput = document.getElementById('std-manual-code');
-    if (manualInput) {
-        manualInput.value = '';
-        manualInput.placeholder = 'امسح الكارت الآن...';
-        manualInput.readOnly = true;
-    }
-    document.addEventListener('keydown', _handleScannerKey, true);
-}
-
-/**
- * إيقاف وضع السكانر
- */
-function stopCodeScanner() {
-    _codeScannerActive = false;
-    document.removeEventListener('keydown', _handleScannerKey, true);
-    clearTimeout(_codeScannerTimer);
-    const scannerStatus = document.getElementById('scanner-status');
-    const scannerBtn    = document.getElementById('btn-scan-code');
-    if (scannerStatus) scannerStatus.style.display = 'none';
-    if (scannerBtn) {
-        scannerBtn.style.background = 'var(--accent)';
-        scannerBtn.innerHTML = '<i class="fas fa-barcode"></i>';
-        scannerBtn.onclick = startCodeScanner;
-    }
-    const manualInput = document.getElementById('std-manual-code');
-    if (manualInput) {
-        manualInput.placeholder = 'اكتب الكود أو امسح الكارت...';
-        manualInput.readOnly = false;
-    }
-}
-
-/**
- * معالج مدخلات السكانر (كتابة سريعة جداً = سكانر)
- */
-function _handleScannerKey(e) {
-    if (!_codeScannerActive) return;
-
-    if (e.key === 'Enter') {
-        e.preventDefault();
-        e.stopPropagation();
-        const code = _codeScannerBuffer.trim();
-        _codeScannerBuffer = '';
-        clearTimeout(_codeScannerTimer);
-        if (code) {
-            _applyScannerCode(code);
-        }
-        return;
-    }
-
-    // تجميع الأحرف
-    if (e.key.length === 1) {
-        _codeScannerBuffer += e.key;
-        clearTimeout(_codeScannerTimer);
-        // إذا مرّت 300ms بدون إدخال جديد → اعتبر المسح انتهى
-        _codeScannerTimer = setTimeout(() => {
-            const code = _codeScannerBuffer.trim();
-            _codeScannerBuffer = '';
-            if (code) _applyScannerCode(code);
-        }, 300);
-    }
-}
-
-/**
- * يضع كود السكانر في الحقل ويوقف وضع السكانر
- */
-function _applyScannerCode(code) {
-    stopCodeScanner();
-    const manualInput = document.getElementById('std-manual-code');
-    if (manualInput) {
-        manualInput.value = code;
-        onManualCodeInput(code);
-    }
-    showNotification('✅ تم قراءة الكود: ' + code, 'success');
-}
-
-/**
- * يُرجع الكود المراد حفظه حسب الوضع المختار
- * إذا كان يدوياً يتحقق من الصحة، وإلا يُولّد تلقائياً
- * @returns {{code: string|null, error: string|null}}
- */
-function _resolveStudentCode() {
-    if (_codeMode === 'auto') {
-        const code = (typeof generateLocalUniqueCode === 'function')
-            ? generateLocalUniqueCode(db.students)
-            : ('1' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 900 + 100));
-        return { code, error: null };
-    }
-
-    // وضع يدوي
-    const manualInput = document.getElementById('std-manual-code');
-    const raw = manualInput ? manualInput.value.trim() : '';
-    if (!raw) {
-        return { code: null, error: 'يرجى إدخال كود الطالب أو اختيار الكود التلقائي' };
-    }
-    const exists = db.students.some(s => String(s.qrCode) === raw);
-    if (exists) {
-        return { code: null, error: 'هذا الكود مستخدم مسبقًا، يرجى اختيار كود آخر' };
-    }
-    return { code: raw, error: null };
-}
-
 async function handleStudentSubmit() {
     const submitBtn = document.querySelector('#student-modal button[onclick="handleStudentSubmit()"]');
     try {
@@ -2684,11 +2476,9 @@ async function handleStudentSubmit() {
             showNotification(`✅ تمت إضافة "${name}" إلى المجموعة الجديدة`, 'success');
         } else {
             // ── طالب جديد — أنشئه ثم أنشئ له enrollment ──
-            const { code: uniqueCode, error: codeError } = _resolveStudentCode();
-            if (codeError) {
-                if (submitBtn) { submitBtn.disabled = false; submitBtn.innerHTML = 'حفظ البيانات'; }
-                return showNotification(codeError, 'error');
-            }
+            const uniqueCode = (typeof generateLocalUniqueCode === 'function')
+                ? generateLocalUniqueCode(db.students)
+                : ('1' + Date.now().toString().slice(-8) + Math.floor(Math.random() * 900 + 100));
 
             student = {
                 id: Date.now(), name, phone, grade: targetGrade,
@@ -2736,7 +2526,6 @@ async function handleStudentSubmit() {
         document.getElementById('std-phone').value = '';
         document.getElementById('std-parent').value = '';
         document.getElementById('std-group').value = '';
-        resetCodeMode();
 
         toggleModal('student-modal', false);
     } catch (err) {
@@ -3236,9 +3025,6 @@ function openAddStudentForGroup() {
     document.getElementById('std-phone').value = '';
     document.getElementById('std-parent').value = '';
 
-    // إعادة ضبط وضع الكود إلى تلقائي
-    resetCodeMode();
-
     // تعيين المجموعة الحالية (من صفحة التفاصيل) تلقائياً
     const groupSelect = document.getElementById('std-group');
     if (groupSelect && activeGroupDetailId) {
@@ -3257,9 +3043,6 @@ function openAddStudentModal() {
     document.getElementById('std-name').value = '';
     document.getElementById('std-phone').value = '';
     document.getElementById('std-parent').value = '';
-
-    // إعادة ضبط وضع الكود إلى تلقائي
-    resetCodeMode();
 
     // تعيين المجموعة الحالية تلقائياً
     const groupSelect = document.getElementById('std-group');
@@ -13083,9 +12866,6 @@ const exposures = {
     handleAddGroup, deleteGroup, showSection, toggleModal, viewGroupDetails, renderGroupStudents,
     openEditGroupModalById, inlineEditStudent, removeStudentFromGroupModal, openAddStudentForGroupModal,
     openAddStudentForGroup, openAddStudentModal, openGroupScanner, removeStudentFromGroup, initStudentGroups, renderGroups,
-
-    // Student Code Mode
-    setCodeMode, resetCodeMode, onManualCodeInput, startCodeScanner, stopCodeScanner,
 
     // Student Management
     handleAddStudent: handleStudentSubmit, renderStudents, deleteStudent, clearAllStudents, viewDetailedProfile,

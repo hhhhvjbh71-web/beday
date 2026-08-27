@@ -2979,45 +2979,6 @@
                 <div id="std-parent-results"
                     style="margin-top: 5px; font-size: 0.85rem; max-height: 100px; overflow-y: auto;"></div>
             </div>
-
-            <!-- ── نوع الكود ── -->
-            <div class="form-group">
-                <label style="display: block; margin-bottom: 0.5rem; font-weight: 600;">كود الطالب</label>
-                <div style="display: flex; gap: 0.5rem; margin-bottom: 0.6rem;">
-                    <button type="button" id="btn-code-auto" onclick="setCodeMode('auto')"
-                        style="flex:1; padding:0.45rem 0; border-radius:8px; border:2px solid var(--primary); background:var(--primary); color:#fff; font-size:0.85rem; cursor:pointer; font-weight:600; transition:all .2s;">
-                        <i class="fas fa-magic"></i> كود تلقائي
-                    </button>
-                    <button type="button" id="btn-code-manual" onclick="setCodeMode('manual')"
-                        style="flex:1; padding:0.45rem 0; border-radius:8px; border:2px solid var(--primary); background:transparent; color:var(--primary); font-size:0.85rem; cursor:pointer; font-weight:600; transition:all .2s;">
-                        <i class="fas fa-keyboard"></i> كود يدوي
-                    </button>
-                </div>
-
-                <!-- حقل الكود اليدوي + زر السكانر -->
-                <div id="manual-code-section" style="display:none;">
-                    <div style="display:flex; gap:0.5rem; align-items:center;">
-                        <input type="text" id="std-manual-code" placeholder="اكتب الكود أو امسح الكارت..."
-                            class="form-input" style="flex:1; font-family:monospace; letter-spacing:1px;"
-                            oninput="onManualCodeInput(this.value)">
-                        <button type="button" id="btn-scan-code" onclick="startCodeScanner()"
-                            title="مسح الكارت بالسكانر"
-                            style="padding:0.6rem 0.9rem; border-radius:8px; border:none; background:var(--accent); color:#fff; cursor:pointer; font-size:1rem; white-space:nowrap; transition:background .2s;">
-                            <i class="fas fa-barcode"></i>
-                        </button>
-                    </div>
-                    <div id="manual-code-preview" style="margin-top:0.4rem; font-size:0.8rem; color:var(--text-muted); min-height:1.1rem;"></div>
-                    <div id="scanner-status" style="display:none; margin-top:0.4rem; font-size:0.8rem; color:var(--accent); font-weight:600;">
-                        <i class="fas fa-spinner fa-spin"></i> في انتظار مسح الكارت...
-                        <button type="button" onclick="stopCodeScanner()" style="margin-right:0.5rem; background:none; border:none; color:var(--danger); cursor:pointer; font-size:0.8rem; text-decoration:underline;">إلغاء</button>
-                    </div>
-                </div>
-
-                <div id="auto-code-preview" style="font-size:0.78rem; color:var(--text-muted); margin-top:0.3rem;">
-                    سيتم إنشاء الكود تلقائياً عند الحفظ
-                </div>
-            </div>
-
             <div style="display: flex; gap: 1rem; margin-top: 1.5rem;">
                 <button class="btn btn-primary" style="flex: 2;" onclick="handleStudentSubmit()">حفظ
                     البيانات</button>
