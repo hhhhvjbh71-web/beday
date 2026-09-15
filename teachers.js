@@ -1,6 +1,6 @@
 // ============================================================
-//  teachers.js  v2.0 — نظام حسابات المدرسين المتكامل
-//  مُربوط بـ halls.js (جدول الحصص المركزي)
+//  teachers.js  v4.0 — نظام حسابات المدرسين المتكامل
+//  التطوير: جدول حضور شهري + تسجيل بتاريخ مخصص + مستحقات شهرية
 // ============================================================
 
 (function () {
@@ -14,6 +14,7 @@
   let _logs      = [];   // سجل تسجيل الحصص الفعلي
   let _payouts   = [];   // سجل المدفوعات
   let _advances  = [];   // سجل السلف
+  let _monthlyDues = []; // سجل المستحقات الشهرية المرحّلة
   let _activeTeacherId = null;
   let _dateFilter = 'month';
   let _customFrom = null;
@@ -22,10 +23,11 @@
   // ── DB helpers ──
   async function loadAll(){
     if(typeof StorageEngine==='undefined') return;
-    _teachers = await _safe('teachers');
-    _logs     = await _safe('teacherLogs');
-    _payouts  = await _safe('teacherPayouts');
-    _advances = await _safe('teacherAdvances');
+    _teachers    = await _safe('teachers');
+    _logs        = await _safe('teacherLogs');
+    _payouts     = await _safe('teacherPayouts');
+    _advances    = await _safe('teacherAdvances');
+    _monthlyDues = await _safe('teacherMonthlyDues');
     await _ensureStores();
   }
 
@@ -39,7 +41,7 @@
   async function _ensureStores(){
     return new Promise(resolve=>{
       if(!StorageEngine.db) return resolve();
-      const needed=['teachers','teacherLogs','teacherPayouts','teacherAdvances'];
+      const needed=['teachers','teacherLogs','teacherPayouts','teacherAdvances','teacherMonthlyDues'];
       const existing=Array.from(StorageEngine.db.objectStoreNames);
       const missing=needed.filter(n=>!existing.includes(n));
       if(missing.length===0) return resolve();
@@ -67,7 +69,7 @@
   }
 
   // ── Helpers ──
-  function _esc(s){ return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function _esc(s){ return String(s||'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function notify(msg,type='success'){ if(typeof showNotification==='function') showNotification(msg,type); else alert(msg); }
   function grpName(gid){
     if(!gid) return 'عام';
@@ -77,6 +79,45 @@
   function gLabel(gid){
     const g=(window.gradesList||[]).find(x=>String(x.id)===String(gid)||String(x.systemCode)===String(gid));
     return g?g.name:(gid||'---');
+  }
+  function _gradeKey(value){
+    const raw = String(value || '').trim();
+    if(!raw) return '';
+    if(Array.isArray(window.CATEGORY_TABLE)){
+      const bySystemCode = window.CATEGORY_TABLE.find(c => String(c.systemCode) === raw);
+      if(bySystemCode) return `cat:${bySystemCode.categoryId}`;
+    }
+    if(typeof toCategoryId === 'function'){
+      const categoryId = toCategoryId(raw);
+      if(categoryId) return `cat:${categoryId}`;
+    }
+    if(typeof gradeIdToSystemCode === 'function'){
+      const sysCode = gradeIdToSystemCode(raw);
+      if(sysCode && sysCode !== raw && typeof toCategoryId === 'function'){
+        const categoryId = toCategoryId(sysCode);
+        if(categoryId) return `cat:${categoryId}`;
+      }
+      if(sysCode) return `sys:${sysCode}`;
+    }
+    const gradeObj = (window.gradesList || []).find(g =>
+      String(g.id) === raw ||
+      String(g.systemCode || '') === raw ||
+      String(g.name || g.label || '') === raw
+    );
+    if(gradeObj){
+      const candidate = gradeObj.systemCode || gradeObj.id || gradeObj.name || gradeObj.label;
+      if(typeof toCategoryId === 'function'){
+        const categoryId = toCategoryId(candidate);
+        if(categoryId) return `cat:${categoryId}`;
+      }
+      return `sys:${candidate}`;
+    }
+    return `raw:${raw}`;
+  }
+  function _sameGrade(a,b){
+    const ak = _gradeKey(a);
+    const bk = _gradeKey(b);
+    return !!ak && !!bk && ak === bk;
   }
   function hallName(hid){
     const halls=window.HallsModule?HallsModule.getHalls():[];
@@ -101,24 +142,48 @@
   }
   function _inRange(d,from,to){ if(!d) return false; const x=d.substring(0,10); return x>=from&&x<=to; }
 
+  // ── حساب قيمة الحصة من تخصيصات المدرس (حسب المجموعة) ──
+  function _getPriceForLog(teacher, log){
+    if(!teacher) return 0;
+    const assignments = teacher.assignments || [];
+    // بحث مطابق بالصف والمجموعة
+    let match = assignments.find(a =>
+      String(a.grade) === String(log.grade) &&
+      String(a.groupId||'') === String(log.groupId||'')
+    );
+    // بحث بالصف فقط لو ما لقيناش بالمجموعة
+    if(!match) match = assignments.find(a => String(a.grade) === String(log.grade));
+    return match ? (match.pricePerSession || 0) : 0;
+  }
+
   // ── Calculate financials ──
   function _calcDue(teacherId, logs=null){
     const t=_teachers.find(x=>x.id===teacherId);
     if(!t) return 0;
     const useLogs=logs||_logs.filter(l=>l.teacherId===teacherId&&l.status==='attended');
     return useLogs.reduce((sum,l)=>{
-      // Find price from teacher assignments
-      const a=(t.assignments||[]).find(x=>
-        String(x.grade)===String(l.grade) &&
-        (String(x.groupId)===String(l.groupId)||(!x.groupId&&!l.groupId)||(!x.groupId))
-      );
-      const price=a?a.pricePerSession:0;
+      const price = _getPriceForLog(t, l);
       return sum+(price||0);
     },0);
   }
 
   function _calcPaid(teacherId){ return _payouts.filter(p=>p.teacherId===teacherId).reduce((s,p)=>s+(p.amount||0),0); }
   function _calcAdvances(teacherId){ return _advances.filter(a=>a.teacherId===teacherId).reduce((s,a)=>s+(a.amount||0),0); }
+
+  // ── حساب مستحقات شهر معين ──
+  function _calcMonthDue(teacherId, yearMonth){
+    const t=_teachers.find(x=>x.id===teacherId);
+    if(!t) return 0;
+    const monthLogs = _logs.filter(l =>
+      l.teacherId===teacherId &&
+      l.status==='attended' &&
+      (l.date||'').substring(0,7) === yearMonth
+    );
+    return monthLogs.reduce((sum,l)=>{
+      const price = _getPriceForLog(t, l);
+      return sum+(price||0);
+    },0);
+  }
 
   // ══════════════════════════════════════════════════════════
   //  INIT
@@ -189,14 +254,12 @@
             </div>
           </div>
 
-          <!-- Today's sessions -->
           ${todayLessons.length>0?`
             <div style="background:#f0f9ff;border-radius:8px;padding:0.5rem 0.75rem;margin-bottom:0.75rem;font-size:0.75rem;">
               <span style="color:#0ea5e9;font-weight:700;"><i class="fas fa-calendar-day" style="margin-left:3px;"></i>اليوم: ${todayLessons.length} حصة</span>
               ${todayLessons.map(l=>`<span style="color:var(--text-muted);margin-right:8px;">${l.timeFrom}–${l.timeTo}</span>`).join('')}
             </div>`:``}
 
-          <!-- Financial summary -->
           <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0.4rem;text-align:center;">
             <div style="background:var(--bg-light);border-radius:9px;padding:0.45rem;">
               <div style="font-size:1rem;font-weight:800;color:#16a34a;">${tLessons.length}</div>
@@ -218,20 +281,65 @@
   // ══════════════════════════════════════════════════════════
   //  TEACHER FORM MODAL
   // ══════════════════════════════════════════════════════════
+  const DAY_DISPLAY_ORDER = ['Saturday','Sunday','Monday','Tuesday','Wednesday','Thursday','Friday'];
+  const DAY_LABEL = {};
+  DAY_KEYS.forEach((k,i)=>{ DAY_LABEL[k]=ARABIC_DAYS[i]; });
+
+  let _formBlocks = [];
+  let _formSelectedGrades = new Set();
+
+  function _uid(){ return 'b'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
+
+  function _buildFormStateFromTeacher(t){
+    const assignments=(t&&t.assignments)||[];
+    const allLessons=(window.HallsModule?HallsModule.getLessons():[]).filter(l=>String(l.teacherId)===String(t?.id));
+    const blocks=[];
+    const covered=new Set();
+
+    assignments.forEach(a=>{
+      const key=`${a.grade}||${a.groupId||''}`;
+      covered.add(key);
+      const slots=allLessons.filter(l=>String(l.grade)===String(a.grade)&&String(l.groupId||'')===String(a.groupId||''))
+        .map(l=>({day:l.day,from:l.timeFrom||'',to:l.timeTo||''}));
+      blocks.push({
+        uid:_uid(), grade:String(a.grade), groupId:a.groupId||null,
+        groupName:a.groupId?grpName(a.groupId):'', price:a.pricePerSession||'',
+        slots
+      });
+    });
+
+    const extraKeys=new Set();
+    allLessons.forEach(l=>{
+      const key=`${l.grade}||${l.groupId||''}`;
+      if(!covered.has(key)) extraKeys.add(key);
+    });
+    extraKeys.forEach(key=>{
+      const sep=key.indexOf('||');
+      const grade=key.slice(0,sep), groupIdRaw=key.slice(sep+2);
+      const groupId=groupIdRaw||null;
+      const slots=allLessons.filter(l=>String(l.grade)===grade&&String(l.groupId||'')===String(groupId||''))
+        .map(l=>({day:l.day,from:l.timeFrom||'',to:l.timeTo||''}));
+      blocks.push({ uid:_uid(), grade, groupId, groupName:groupId?grpName(groupId):'', price:'', slots });
+    });
+
+    return blocks;
+  }
+
   function showAddTeacherModal(editId=null){
     const t=editId?_teachers.find(x=>x.id===editId):null;
-    const assignments=t?.assignments||[{grade:'',groupId:'',pricePerSession:''}];
+    _formBlocks=t?_buildFormStateFromTeacher(t):[];
+    _formSelectedGrades=new Set(_formBlocks.map(b=>String(b.grade)));
 
-    const modal=_mkModal('teacher-form-modal',`
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;">
+    const modal=_mkModalWide('teacher-form-modal',`
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.4rem;">
         <h2 style="margin:0;color:var(--primary);font-size:1.15rem;font-weight:800;">
           <i class="fas fa-chalkboard-teacher" style="margin-left:8px;"></i>
           ${editId?'تعديل بيانات المدرس':'إضافة مدرس جديد'}
         </h2>
-        <button onclick="window._closeModal('teacher-form-modal')" style="background:var(--bg-light);border:none;border-radius:50%;width:36px;height:36px;cursor:pointer;"><i class="fas fa-times"></i></button>
+        <button onclick="window._closeModal('teacher-form-modal')" style="background:var(--bg-light);border:none;border-radius:50%;width:36px;height:36px;cursor:pointer;flex-shrink:0;"><i class="fas fa-times"></i></button>
       </div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.2rem;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-bottom:1.3rem;">
         <div>
           <label style="font-weight:700;font-size:0.85rem;display:block;margin-bottom:4px;">اسم المدرس *</label>
           <input id="t-name" type="text" class="form-input" value="${_esc(t?.name||'')}" placeholder="مثال: أحمد محمد">
@@ -242,20 +350,22 @@
         </div>
       </div>
 
-      <!-- الصفوف والمجموعات وسعر الحصة -->
-      <div style="margin-bottom:1.5rem;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.7rem;">
-          <label style="font-weight:700;font-size:0.9rem;"><i class="fas fa-layer-group" style="color:var(--primary);margin-left:5px;"></i>الصفوف والمجموعات وأسعار الحصص</label>
-          <button onclick="TeachersModule._addAssignRow()" style="background:var(--primary);color:white;border:none;border-radius:8px;padding:4px 12px;cursor:pointer;font-size:0.8rem;">
-            <i class="fas fa-plus"></i> إضافة
-          </button>
-        </div>
-        <div id="t-assignments-list">
-          ${assignments.map((a,i)=>_assignRowHTML(a,i)).join('')}
+      <div style="margin-bottom:1.3rem;">
+        <label style="font-weight:700;font-size:0.9rem;display:block;margin-bottom:0.6rem;">
+          <i class="fas fa-layer-group" style="color:var(--primary);margin-left:5px;"></i>الصفوف الدراسية (يمكن اختيار أكثر من صف)
+        </label>
+        <div id="t-grades-checks" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:0.5rem;">
+          ${_renderGradeCheckboxes()}
         </div>
       </div>
 
-      <div style="display:flex;gap:0.75rem;justify-content:flex-end;">
+      <div id="t-grade-blocks">
+        ${_renderGradeBlocks()}
+      </div>
+
+      <div id="t-conflict-zone" style="display:none;margin-top:1rem;"></div>
+
+      <div style="display:flex;gap:0.75rem;justify-content:flex-end;margin-top:1.5rem;">
         <button onclick="window._closeModal('teacher-form-modal')" class="btn" style="background:var(--bg-light);border:1px solid var(--border);">إلغاء</button>
         <button onclick="TeachersModule._saveTeacher(${editId||'null'})" class="btn btn-primary" style="border-radius:10px;padding:0.6rem 2rem;">
           <i class="fas fa-save"></i> حفظ
@@ -263,50 +373,212 @@
       </div>
     `);
     document.body.appendChild(modal);
-    _bindGradeListeners();
+    _checkFormConflicts(true);
   }
 
   function showEditTeacherModal(id){ showAddTeacherModal(id); }
 
-  function _assignRowHTML(a={},i=0){
-    const gradeOpts=_buildGradeOpts(a.grade||'');
-    const groupOpts=_buildGroupOpts(a.grade||'',a.groupId||'');
+  function _renderGradeCheckboxes(){
+    const list=Array.isArray(window.gradesList)?window.gradesList:[];
+    return list.map(g=>{
+      const gid=String(window.GradeGroupLinkSystem.gradeIdOf(g));
+      const checked=_formSelectedGrades.has(gid);
+      return `
+        <label style="display:flex;align-items:center;gap:8px;padding:0.6rem 0.75rem;border:1.5px solid ${checked?'var(--primary)':'var(--border)'};
+          background:${checked?'rgba(37,99,235,0.06)':'var(--bg-white)'};border-radius:10px;cursor:pointer;font-size:0.85rem;font-weight:700;transition:var(--transition);">
+          <input type="checkbox" value="${_esc(gid)}" ${checked?'checked':''}
+            onchange="TeachersModule._toggleGrade('${gid}',this.checked)" style="width:18px;height:18px;cursor:pointer;flex-shrink:0;">
+          ${_esc(g.name)}
+        </label>`;
+    }).join('');
+  }
+
+  function _renderGradeBlocks(){
+    if(_formSelectedGrades.size===0){
+      return `<p style="color:var(--text-muted);font-size:0.85rem;padding:1rem 0;">اختر صفًا دراسيًا واحدًا على الأقل من الأعلى لتبدأ بإضافة المجموعات ومواعيدها.</p>`;
+    }
+    return Array.from(_formSelectedGrades).map(gid=>_renderOneGradeBlock(gid)).join('');
+  }
+
+  function _renderOneGradeBlock(gid){
+    const blocks=_formBlocks.filter(b=>String(b.grade)===String(gid));
     return `
-      <div class="t-assign-row" style="display:grid;grid-template-columns:1fr 1fr 1fr 36px;gap:0.5rem;margin-bottom:0.5rem;align-items:center;">
-        <select class="form-input t-grade-sel" style="font-size:0.84rem;" onchange="TeachersModule._onGradeChange(this,${i})">
-          <option value="">اختر الصف</option>
-          ${gradeOpts}
-        </select>
-        <select class="form-input t-group-sel" style="font-size:0.84rem;">
-          <option value="">اختر المجموعة</option>
-          ${groupOpts}
-        </select>
-        <input type="number" class="form-input t-price-inp" min="0" placeholder="سعر الحصة (ج)" style="font-size:0.84rem;" value="${a.pricePerSession||''}">
-        <button onclick="this.closest('.t-assign-row').remove()"
-          style="background:#fef2f2;border:none;border-radius:8px;height:38px;width:36px;cursor:pointer;color:#ef4444;">
-          <i class="fas fa-minus"></i>
-        </button>
+      <div id="t-grade-block-${_esc(gid)}" style="background:var(--bg-light);border-radius:14px;padding:1rem;margin-bottom:1rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.8rem;flex-wrap:wrap;gap:0.5rem;">
+          <h4 style="margin:0;font-size:0.95rem;font-weight:800;color:var(--text-main);">
+            <i class="fas fa-graduation-cap" style="color:var(--primary);margin-left:5px;"></i>${_esc(gLabel(gid))}
+          </h4>
+          <button onclick="TeachersModule._addGroupBlock('${_esc(gid)}')"
+            style="background:var(--primary);color:white;border:none;border-radius:8px;padding:6px 14px;cursor:pointer;font-size:0.8rem;font-weight:700;">
+            <i class="fas fa-plus"></i> إضافة مجموعة
+          </button>
+        </div>
+        ${blocks.length===0
+          ?`<p style="color:var(--text-muted);font-size:0.82rem;">لا توجد مجموعات بعد لهذا الصف — اضغط "إضافة مجموعة".</p>`
+          :blocks.map(b=>_renderGroupBlock(b)).join('')}
       </div>`;
   }
 
-  function _addAssignRow(){
-    const list=document.getElementById('t-assignments-list');
-    if(!list) return;
-    const i=list.querySelectorAll('.t-assign-row').length;
-    list.insertAdjacentHTML('beforeend',_assignRowHTML({},i));
-    _bindGradeListeners();
+  function _renderGroupBlock(b){
+    const suggestions=window.GradeGroupLinkSystem?window.GradeGroupLinkSystem.listGroupNamesForGrade(b.grade):[];
+    return `
+      <div class="t-group-block" data-uid="${b.uid}" style="background:var(--bg-white);border:1.5px solid var(--border);border-radius:12px;padding:0.9rem;margin-bottom:0.75rem;">
+        <div style="display:grid;grid-template-columns:1fr 140px 40px;gap:0.5rem;margin-bottom:0.8rem;align-items:center;">
+          <div>
+            <input type="text" list="t-group-sugg-${b.uid}" autocomplete="off" placeholder="اسم المجموعة (مثال: مجموعة 1)"
+              value="${_esc(b.groupName)}" style="width:100%;padding:0.6rem 0.7rem;border:1.5px solid var(--border);border-radius:9px;font-family:inherit;font-size:0.85rem;box-sizing:border-box;"
+              onchange="TeachersModule._updateBlockField('${b.uid}','groupName',this.value)">
+            <datalist id="t-group-sugg-${b.uid}">${suggestions.map(n=>`<option value="${_esc(n)}">`).join('')}</datalist>
+          </div>
+          <input type="number" min="0" placeholder="سعر الحصة (ج)" value="${b.price}"
+            style="padding:0.6rem 0.7rem;border:1.5px solid var(--border);border-radius:9px;font-family:inherit;font-size:0.85rem;box-sizing:border-box;height:38px;"
+            onchange="TeachersModule._updateBlockField('${b.uid}','price',this.value)">
+          <button onclick="TeachersModule._removeGroupBlock('${b.uid}')"
+            style="background:#fef2f2;border:none;border-radius:9px;height:38px;cursor:pointer;color:#ef4444;">
+            <i class="fas fa-trash"></i>
+          </button>
+        </div>
+        <div style="font-size:0.78rem;font-weight:700;color:var(--text-muted);margin-bottom:6px;">مواعيد المجموعة (اضغط على اليوم لتحديده):</div>
+        <div style="display:flex;gap:0.5rem;overflow-x:auto;padding-bottom:4px;">
+          ${DAY_DISPLAY_ORDER.map(dk=>_renderDayCard(b,dk)).join('')}
+        </div>
+      </div>`;
   }
 
-  function _onGradeChange(sel){
-    const row=sel.closest('.t-assign-row');
-    const grpSel=row?.querySelector('.t-group-sel');
-    if(grpSel) grpSel.innerHTML='<option value="">اختر المجموعة</option>'+_buildGroupOpts(sel.value,'');
+  function _renderDayCard(b,dayKey){
+    const slot=b.slots.find(s=>s.day===dayKey);
+    const active=!!slot;
+    return `
+      <div style="flex:0 0 auto;min-width:104px;border:1.5px solid ${active?'var(--primary)':'var(--border)'};
+        background:${active?'rgba(37,99,235,0.06)':'var(--bg-white)'};border-radius:10px;padding:0.5rem;text-align:center;">
+        <button onclick="TeachersModule._toggleDay('${b.uid}','${dayKey}')"
+          style="width:100%;border:none;background:transparent;cursor:pointer;font-weight:800;font-size:0.82rem;
+            color:${active?'var(--primary)':'var(--text-main)'};padding:4px 0;">
+          ${DAY_LABEL[dayKey]}
+        </button>
+        ${active?`
+          <div style="display:flex;flex-direction:column;gap:4px;margin-top:4px;">
+            <input type="time" value="${slot.from||''}" onchange="TeachersModule._updateSlotTime('${b.uid}','${dayKey}','from',this.value)"
+              style="width:100%;padding:3px;border:1px solid var(--border);border-radius:6px;font-size:0.75rem;box-sizing:border-box;">
+            <input type="time" value="${slot.to||''}" onchange="TeachersModule._updateSlotTime('${b.uid}','${dayKey}','to',this.value)"
+              style="width:100%;padding:3px;border:1px solid var(--border);border-radius:6px;font-size:0.75rem;box-sizing:border-box;">
+          </div>`:''}
+      </div>`;
   }
 
-  function _bindGradeListeners(){
-    document.querySelectorAll('.t-grade-sel').forEach(sel=>{
-      sel.onchange=function(){ _onGradeChange(this); };
+  function _toggleGrade(gid,checked){
+    gid=String(gid);
+    if(checked) _formSelectedGrades.add(gid);
+    else _formSelectedGrades.delete(gid);
+    const checksEl=document.getElementById('t-grades-checks');
+    if(checksEl) checksEl.innerHTML=_renderGradeCheckboxes();
+    const wrap=document.getElementById('t-grade-blocks');
+    if(wrap) wrap.innerHTML=_renderGradeBlocks();
+    _checkFormConflicts(true);
+  }
+
+  function _addGroupBlock(gid){
+    _formBlocks.push({uid:_uid(),grade:String(gid),groupId:null,groupName:'',price:'',slots:[]});
+    _rerenderGradeSection(gid);
+  }
+
+  function _removeGroupBlock(uid){
+    const b=_formBlocks.find(x=>x.uid===uid);
+    const grade=b?b.grade:null;
+    _formBlocks=_formBlocks.filter(x=>x.uid!==uid);
+    if(grade!==null) _rerenderGradeSection(grade);
+  }
+
+  function _updateBlockField(uid,field,value){
+    const b=_formBlocks.find(x=>x.uid===uid);
+    if(!b) return;
+    if(field==='price') b.price=parseFloat(value)||0;
+    else b[field]=value;
+  }
+
+  function _toggleDay(uid,dayKey){
+    const b=_formBlocks.find(x=>x.uid===uid);
+    if(!b) return;
+    const idx=b.slots.findIndex(s=>s.day===dayKey);
+    if(idx===-1) b.slots.push({day:dayKey,from:'',to:''});
+    else b.slots.splice(idx,1);
+    _rerenderGroupBlock(uid);
+  }
+
+  function _updateSlotTime(uid,dayKey,which,value){
+    const b=_formBlocks.find(x=>x.uid===uid);
+    if(!b) return;
+    const slot=b.slots.find(s=>s.day===dayKey);
+    if(!slot) return;
+    slot[which]=value;
+    if(which==='from' && value && !slot.to){
+      const mins=(toMin(value)+60)%1440;
+      slot.to=`${String(Math.floor(mins/60)).padStart(2,'0')}:${String(mins%60).padStart(2,'0')}`;
+      _rerenderGroupBlock(uid);
+      return;
+    }
+    _checkFormConflicts(true);
+  }
+
+  function _rerenderGradeSection(gid){
+    gid=String(gid);
+    const el=document.getElementById('t-grade-block-'+gid);
+    if(el){ el.outerHTML=_renderOneGradeBlock(gid); }
+    else {
+      const wrap=document.getElementById('t-grade-blocks');
+      if(wrap) wrap.innerHTML=_renderGradeBlocks();
+    }
+    _checkFormConflicts(true);
+  }
+
+  function _rerenderGroupBlock(uid){
+    const b=_formBlocks.find(x=>x.uid===uid);
+    if(!b) return;
+    const el=document.querySelector('.t-group-block[data-uid="'+uid+'"]');
+    if(el) el.outerHTML=_renderGroupBlock(b);
+    _checkFormConflicts(true);
+  }
+
+  function _findConflicts(){
+    const all=[];
+    _formBlocks.forEach(b=>{
+      if(!_formSelectedGrades.has(String(b.grade))) return;
+      b.slots.forEach(s=>{
+        if(!s.day||!s.from||!s.to) return;
+        if(toMin(s.to)<=toMin(s.from)) return;
+        all.push({uid:b.uid,grade:b.grade,groupName:b.groupName||'—',day:s.day,from:s.from,to:s.to});
+      });
     });
+    const conflicts=[];
+    for(let i=0;i<all.length;i++){
+      for(let j=i+1;j<all.length;j++){
+        const A=all[i],B=all[j];
+        if(A.day!==B.day) continue;
+        if(toMin(A.from)<toMin(B.to)&&toMin(B.from)<toMin(A.to)) conflicts.push({a:A,b:B});
+      }
+    }
+    return conflicts;
+  }
+
+  function _checkFormConflicts(renderInline){
+    const conflicts=_findConflicts();
+    if(!renderInline) return conflicts;
+    const zone=document.getElementById('t-conflict-zone');
+    if(!zone) return conflicts;
+    if(conflicts.length===0){ zone.style.display='none'; zone.innerHTML=''; return conflicts; }
+    zone.style.display='block';
+    zone.innerHTML=`
+      <div style="background:#fef2f2;border:1.5px solid #fca5a5;border-radius:10px;padding:0.8rem 1rem;">
+        <div style="font-weight:800;color:#991b1b;margin-bottom:6px;">
+          <i class="fas fa-exclamation-triangle"></i> يوجد تعارض في جدول المدرس.
+        </div>
+        ${conflicts.map(c=>`
+          <div style="font-size:0.8rem;color:#991b1b;padding:2px 0;">
+            • ${DAY_LABEL[c.a.day]}: ${_esc(gLabel(c.a.grade))} (${_esc(c.a.groupName)}) ${c.a.from}–${c.a.to}
+            ⟷ ${_esc(gLabel(c.b.grade))} (${_esc(c.b.groupName)}) ${c.b.from}–${c.b.to}
+          </div>`).join('')}
+      </div>`;
+    return conflicts;
   }
 
   async function _saveTeacher(editId){
@@ -314,38 +586,103 @@
     const subject=document.getElementById('t-subject')?.value.trim();
     if(!name) return notify('يرجى إدخال اسم المدرس','error');
     if(!subject) return notify('يرجى إدخال المادة','error');
+    if(_formSelectedGrades.size===0) return notify('يرجى اختيار صف دراسي واحد على الأقل','error');
 
-    const assignments=[];
-    document.querySelectorAll('.t-assign-row').forEach(row=>{
-      const grade=row.querySelector('.t-grade-sel')?.value;
-      const groupId=row.querySelector('.t-group-sel')?.value||null;
-      const pricePerSession=parseFloat(row.querySelector('.t-price-inp')?.value)||0;
-      if(grade) assignments.push({grade,groupId,pricePerSession});
-    });
+    const activeBlocks=_formBlocks.filter(b=>_formSelectedGrades.has(String(b.grade)));
+    if(activeBlocks.length===0) return notify('يرجى إضافة مجموعة واحدة على الأقل','error');
+
+    for(const b of activeBlocks){
+      if(!String(b.groupName||'').trim()) return notify(`يرجى كتابة اسم المجموعة في صف "${gLabel(b.grade)}"`,'error');
+    }
+    for(const b of activeBlocks){
+      for(const s of b.slots){
+        if(!s.from||!s.to) return notify(`يرجى تحديد وقت البداية والنهاية ليوم ${DAY_LABEL[s.day]} في مجموعة "${b.groupName}"`,'error');
+        if(toMin(s.to)<=toMin(s.from)) return notify(`وقت نهاية الحصة يجب أن يكون بعد وقت البداية`,'error');
+      }
+    }
+
+    const conflicts=_checkFormConflicts(true);
+    if(conflicts.length>0) return notify('❌ يوجد تعارض في جدول المدرس.','error');
+
+    for(const b of activeBlocks){
+      const grp=await window.GradeGroupLinkSystem.findOrCreateGroupByName(b.grade,b.groupName.trim());
+      b.groupId=grp?grp.id:null;
+    }
+
+    const assignments=activeBlocks.map(b=>({grade:b.grade,groupId:b.groupId,pricePerSession:parseFloat(b.price)||0}));
 
     const teacherId=editId||Date.now();
     if(editId){
-      const idx=_teachers.findIndex(t=>t.id===editId);
+      const idx=_teachers.findIndex(x=>x.id===editId);
       if(idx!==-1) _teachers[idx]={..._teachers[idx],name,subject,assignments};
     } else {
       _teachers.push({id:teacherId,name,subject,assignments,createdAt:new Date().toISOString()});
     }
     await StorageEngine.save('teachers', _teachers);
+
+    await _syncLessonsForTeacher(teacherId, subject, activeBlocks);
+
     window._closeModal('teacher-form-modal');
     renderTeachersGrid();
-    notify(editId?'✅ تم تعديل بيانات المدرس':'✅ تم إضافة المدرس بنجاح','success');
+    if(_activeTeacherId===teacherId){ const tt=_teachers.find(x=>x.id===teacherId); if(tt) renderTeacherAccount(tt); }
+    notify(editId?'✅ تم تعديل بيانات المدرس وجدوله':'✅ تم إضافة المدرس وجدوله بنجاح','success');
+  }
+
+  async function _syncLessonsForTeacher(teacherId, subject, activeBlocks){
+    let existing=[];
+    try{ existing=(await StorageEngine.getAll('lessons')||[]).filter(l=>String(l.teacherId)===String(teacherId)); }
+    catch(e){ existing=[]; }
+
+    const existingByKey=new Map();
+    existing.forEach(l=>existingByKey.set(`${l.grade}||${l.groupId||''}||${l.day}`, l));
+
+    const toSave=[];
+    const keepKeys=new Set();
+    let counter=0;
+    const baseId=Date.now();
+
+    activeBlocks.forEach(b=>{
+      b.slots.forEach(s=>{
+        const key=`${b.grade}||${b.groupId||''}||${s.day}`;
+        keepKeys.add(key);
+        const old=existingByKey.get(key);
+        if(old){
+          toSave.push({...old, teacherId, subject, grade:b.grade, groupId:b.groupId, day:s.day, timeFrom:s.from, timeTo:s.to});
+        } else {
+          toSave.push({
+            id: baseId+(counter++), hallId:null, teacherId, subject,
+            grade:b.grade, groupId:b.groupId, day:s.day, timeFrom:s.from, timeTo:s.to,
+            notes:'', createdAt:new Date().toISOString()
+          });
+        }
+      });
+    });
+
+    const toDeleteIds=existing.filter(l=>!keepKeys.has(`${l.grade}||${l.groupId||''}||${l.day}`)).map(l=>l.id);
+
+    if(toSave.length>0) await StorageEngine.save('lessons', toSave);
+    for(const id of toDeleteIds) await StorageEngine.delete('lessons', id);
+
+    if(window.HallsModule && typeof HallsModule.reload==='function'){
+      try{ await HallsModule.reload(); }catch(e){}
+    }
   }
 
   async function deleteTeacher(id){
     if(!confirm('هل أنت متأكد من حذف هذا المدرس وكل بياناته؟')) return;
     _teachers=_teachers.filter(t=>t.id!==id);
     await StorageEngine.delete('teachers',id);
-    // delete logs
     const logIds=_logs.filter(l=>l.teacherId===id).map(l=>l.id);
     for(const k of logIds) await _delFrom('teacherLogs',k);
     _logs=_logs.filter(l=>l.teacherId!==id);
+    try{
+      const allLessons=await StorageEngine.getAll('lessons')||[];
+      const idsToDelete=allLessons.filter(l=>String(l.teacherId)===String(id)).map(l=>l.id);
+      for(const lid of idsToDelete) await StorageEngine.delete('lessons', lid);
+      if(window.HallsModule && typeof HallsModule.reload==='function') await HallsModule.reload();
+    }catch(e){ console.warn('[teachers] تعذر تنظيف حصص المدرس المحذوف',e); }
     renderTeachersGrid();
-    notify('✅ تم حذف المدرس','success');
+    notify('✅ تم حذف المدرس وجدوله بالكامل','success');
   }
 
   // ══════════════════════════════════════════════════════════
@@ -369,6 +706,19 @@
     renderTeachersGrid();
   }
 
+  // ── الحصول على اسم الشهر بالعربية ──
+  function _monthNameAr(yearMonth){
+    const months=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+    const [y,m]=yearMonth.split('-');
+    return `${months[parseInt(m,10)-1]} ${y}`;
+  }
+
+  // ── الشهر الحالي yyyy-mm ──
+  function _currentYearMonth(){
+    const d=new Date();
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+  }
+
   function renderTeacherAccount(t){
     const el=document.getElementById('teacher-account-content');
     if(!el) return;
@@ -385,21 +735,8 @@
     const totalAdv=_calcAdvances(t.id);
     const remaining=Math.max(0,totalDue-totalPaid-totalAdv);
 
-    // Weekly schedule from HallsModule
     const tLessons=_teacherLessons(t.id);
-    const todayKey=DAY_KEYS[new Date().getDay()];
-    const todaySessions=tLessons.filter(l=>l.day===todayKey);
-    const today=new Date().toISOString().split('T')[0];
-    const todayLogsDone=_logs.filter(l=>l.teacherId===t.id&&l.date?.startsWith(today));
-
-    // Breakdown by assignment + session detail
-    const breakdown=(t.assignments||[]).map(a=>{
-      const gl=gLabel(a.grade);
-      const grp=grpName(a.groupId);
-      const sessLogs=attendedLogs.filter(l=>String(l.grade)===String(a.grade)&&
-        (String(l.groupId)===String(a.groupId)||!a.groupId||!l.groupId));
-      return {label:`${gl} — ${grp}`,price:a.pricePerSession||0,count:sessLogs.length,subtotal:sessLogs.length*(a.pricePerSession||0),logs:sessLogs};
-    });
+    const teacherMonthlyDues=_monthlyDues.filter(d=>d.teacherId===t.id).sort((a,b)=>b.yearMonth.localeCompare(a.yearMonth));
 
     el.innerHTML=`
       <!-- Header -->
@@ -415,6 +752,10 @@
         <button onclick="TeachersModule.showAddTeacherModal(${t.id})"
           style="background:var(--bg-light);border:1px solid var(--border);border-radius:10px;padding:0.5rem 1rem;cursor:pointer;">
           <i class="fas fa-edit"></i> تعديل
+        </button>
+        <button onclick="TeachersModule.showNewMonthModal(${t.id})"
+          style="background:linear-gradient(135deg,#7c3aed,#4f46e5);color:white;border:none;border-radius:10px;padding:0.5rem 1.2rem;cursor:pointer;font-weight:700;">
+          <i class="fas fa-calendar-plus"></i> بداية شهر جديد
         </button>
         <button onclick="TeachersModule.showPayoutModal(${t.id})"
           style="background:linear-gradient(135deg,#16a34a,#15803d);color:white;border:none;border-radius:10px;padding:0.5rem 1.2rem;cursor:pointer;font-weight:700;">
@@ -440,7 +781,8 @@
             style="border-radius:8px;border:1px solid var(--border);padding:4px 8px;font-size:0.8rem;">
           <span style="color:var(--text-muted);">→</span>
           <input type="date" id="ct" value="${_customTo||''}" onchange="TeachersModule.setCustomRange()"
-            style="border-radius:8px;border:1px solid var(--border);padding:4px 8px;font-size:0.8rem;">`:''}
+            style="border-radius:8px;border:1px solid var(--border);padding:4px 8px;font-size:0.8rem;">`:''
+        }
       </div>
 
       <!-- Main stats -->
@@ -461,91 +803,11 @@
           </div>`).join('')}
       </div>
 
-      <!-- Today's Sessions -->
-      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
-        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
-          <i class="fas fa-calendar-day" style="margin-left:6px;"></i> حصص اليوم (${todaySessions.length})
-        </h3>
-        ${todaySessions.length===0
-          ?`<p style="color:var(--text-muted);font-size:0.85rem;">لا توجد حصص مجدولة اليوم.</p>`
-          :todaySessions.map(s=>{
-            const log=todayLogsDone.find(l=>l.lessonId===s.id||
-              (l.grade===s.grade&&l.groupId===s.groupId&&l.date?.startsWith(today)));
-            const hallN=hallName(s.hallId);
-            const grp=grpName(s.groupId);
-            const gl=gLabel(s.grade);
-            const statusBadge={
-              attended:`<span style="color:#16a34a;font-weight:700;padding:2px 8px;background:#f0fdf4;border-radius:8px;font-size:0.75rem;">✓ حضر</span>`,
-              absent:`<span style="color:#ef4444;font-weight:700;padding:2px 8px;background:#fef2f2;border-radius:8px;font-size:0.75rem;">✕ غائب</span>`,
-              postponed:`<span style="color:#f59e0b;font-weight:700;padding:2px 8px;background:#fffbeb;border-radius:8px;font-size:0.75rem;">⏸ مؤجّل</span>`,
-              cancelled:`<span style="color:#6b7280;font-weight:700;padding:2px 8px;background:#f9fafb;border-radius:8px;font-size:0.75rem;">✕ ملغي</span>`,
-            };
-            return `
-              <div style="padding:0.85rem;border:1.5px solid var(--border);border-radius:12px;margin-bottom:0.5rem;">
-                <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
-                  <div style="flex:1;min-width:140px;">
-                    <div style="font-weight:700;font-size:0.9rem;">${s.timeFrom}–${s.timeTo}</div>
-                    <div style="font-size:0.78rem;color:var(--text-muted);">${gl} · ${grp} · <span style="color:#8b5cf6;">${hallN}</span></div>
-                  </div>
-                  <div>${log?(statusBadge[log.status]||''):'<span style="color:var(--text-muted);font-size:0.78rem;">لم يُسجَّل</span>'}</div>
-                  <div style="display:flex;gap:5px;flex-wrap:wrap;">
-                    ${['attended','absent','postponed','cancelled'].map(st=>`
-                      <button onclick="TeachersModule.logSession(${t.id},'${s.id}','${st}','${s.grade}','${s.groupId||''}','${s.hallId||''}')"
-                        style="padding:4px 9px;border:none;border-radius:7px;cursor:pointer;font-weight:700;font-size:0.75rem;
-                          background:${{attended:'#dcfce7',absent:'#fef2f2',postponed:'#fefce8',cancelled:'#f9fafb'}[st]};
-                          color:${{attended:'#16a34a',absent:'#ef4444',postponed:'#f59e0b',cancelled:'#6b7280'}[st]};">
-                        ${{attended:'✓ حضر',absent:'✕ غياب',postponed:'تأجيل',cancelled:'إلغاء'}[st]}
-                      </button>`).join('')}
-                  </div>
-                </div>
-              </div>`;
-          }).join('')}
-      </div>
+      <!-- جدول الحضور والغياب الشهري -->
+      ${_renderAttendanceTable(t)}
 
       <!-- Detailed Session Statement -->
-      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
-        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
-          <i class="fas fa-file-invoice" style="margin-left:6px;"></i> كشف الحصص التفصيلي
-        </h3>
-        <div style="overflow-x:auto;">
-          <table style="width:100%;border-collapse:collapse;font-size:0.82rem;min-width:600px;">
-            <thead>
-              <tr style="background:var(--bg-light);">
-                <th style="padding:8px 10px;text-align:right;border-radius:8px 0 0 8px;">التاريخ</th>
-                <th style="padding:8px 10px;text-align:center;">المجموعة</th>
-                <th style="padding:8px 10px;text-align:center;">المادة</th>
-                <th style="padding:8px 10px;text-align:center;">القاعة</th>
-                <th style="padding:8px 10px;text-align:center;">عدد الحصص</th>
-                <th style="padding:8px 10px;text-align:center;">سعر الحصة</th>
-                <th style="padding:8px 10px;text-align:left;border-radius:0 8px 8px 0;">القيمة</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${breakdown.map(b=>`
-                ${b.logs.map(lg=>`
-                  <tr style="border-bottom:1px solid var(--bg-light);">
-                    <td style="padding:7px 10px;">${new Date(lg.date).toLocaleDateString('ar-EG')}</td>
-                    <td style="padding:7px 10px;text-align:center;">${_esc(grpName(lg.groupId))}</td>
-                    <td style="padding:7px 10px;text-align:center;">${_esc(t.subject||gLabel(lg.grade))}</td>
-                    <td style="padding:7px 10px;text-align:center;">${_esc(hallName(lg.hallId||''))}</td>
-                    <td style="padding:7px 10px;text-align:center;">1</td>
-                    <td style="padding:7px 10px;text-align:center;">${b.price.toLocaleString('ar-EG')} ج</td>
-                    <td style="padding:7px 10px;text-align:left;font-weight:700;color:var(--primary);">${b.price.toLocaleString('ar-EG')} ج</td>
-                  </tr>`).join('')}`).join('')}
-              ${attendedLogs.length===0?`
-                <tr><td colspan="7" style="padding:1.5rem;text-align:center;color:var(--text-muted);">لا توجد حصص مسجّلة في هذه الفترة</td></tr>`:''}
-            </tbody>
-            <tfoot>
-              <tr style="background:var(--bg-light);font-weight:800;">
-                <td colspan="4" style="padding:9px 10px;border-radius:8px 0 0 8px;">الإجمالي (${attendedLogs.length} حصة)</td>
-                <td style="padding:9px 10px;text-align:center;">${attendedLogs.length}</td>
-                <td style="padding:9px 10px;text-align:center;">---</td>
-                <td style="padding:9px 10px;text-align:left;color:var(--primary);font-size:0.95rem;border-radius:0 8px 8px 0;">${totalDue.toLocaleString('ar-EG')} ج</td>
-              </tr>
-            </tfoot>
-          </table>
-        </div>
-      </div>
+      ${_renderSessionStatement(t, attendedLogs)}
 
       <!-- Financial Summary -->
       <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
@@ -566,13 +828,50 @@
         </div>
       </div>
 
-      <!-- Weekly Schedule from Hall System -->
+      <!-- المستحقات الشهرية -->
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-calendar-alt" style="margin-left:6px;"></i> المستحقات الشهرية المحفوظة
+        </h3>
+        ${teacherMonthlyDues.length===0
+          ?`<p style="color:var(--text-muted);font-size:0.85rem;">لم يتم ترحيل أي شهر بعد. عند الضغط على "بداية شهر جديد" سيتم حفظ مستحقات الشهر الحالي هنا.</p>`
+          :`<div style="overflow-x:auto;">
+              <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+                <thead><tr style="background:var(--bg-light);">
+                  <th style="padding:8px 10px;text-align:right;">الشهر</th>
+                  <th style="padding:8px 10px;text-align:center;">عدد الحصص</th>
+                  <th style="padding:8px 10px;text-align:center;">المستحقات (ج)</th>
+                  <th style="padding:8px 10px;text-align:center;">تاريخ الترحيل</th>
+                  <th style="padding:8px 10px;text-align:center;">ملاحظات</th>
+                </tr></thead>
+                <tbody>
+                  ${teacherMonthlyDues.map(d=>`
+                    <tr style="border-bottom:1px solid var(--bg-light);">
+                      <td style="padding:8px 10px;font-weight:700;">${_esc(_monthNameAr(d.yearMonth))}</td>
+                      <td style="padding:8px 10px;text-align:center;">${d.sessionCount||0}</td>
+                      <td style="padding:8px 10px;text-align:center;font-weight:800;color:#4f46e5;">${(d.amount||0).toLocaleString('ar-EG')}</td>
+                      <td style="padding:8px 10px;text-align:center;color:var(--text-muted);">${new Date(d.archivedAt||d.id).toLocaleDateString('ar-EG')}</td>
+                      <td style="padding:8px 10px;color:var(--text-muted);">${_esc(d.notes||'—')}</td>
+                    </tr>`).join('')}
+                  <tr style="background:var(--bg-light);font-weight:800;">
+                    <td style="padding:8px 10px;">الإجمالي</td>
+                    <td style="padding:8px 10px;text-align:center;">${teacherMonthlyDues.reduce((s,d)=>s+(d.sessionCount||0),0)}</td>
+                    <td style="padding:8px 10px;text-align:center;color:#4f46e5;">${teacherMonthlyDues.reduce((s,d)=>s+(d.amount||0),0).toLocaleString('ar-EG')}</td>
+                    <td colspan="2"></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>`
+        }
+      </div>
+
+      <!-- Weekly Schedule -->
       <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
         <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
           <i class="fas fa-calendar-week" style="margin-left:6px;"></i> الجدول الأسبوعي
         </h3>
         ${tLessons.length===0
-          ?`<p style="color:var(--text-muted);font-size:0.85rem;">لم يتم إضافة حصص في نظام القاعات بعد. <a href="#" onclick="showSection('halls',document.getElementById('nav-halls'))" style="color:var(--primary);">انتقل إلى القاعات</a> لإضافة حصص.</p>`
+          ?`<p style="color:var(--text-muted);font-size:0.85rem;">لم يتم إضافة حصص في نظام القاعات بعد.</p>`
           :`<div style="overflow-x:auto;">
               <table style="width:100%;border-collapse:collapse;font-size:0.82rem;min-width:500px;">
                 <thead>
@@ -618,75 +917,353 @@
     `;
   }
 
-  function toMin(t){ const[h,m]=(t||'00:00').split(':').map(Number); return h*60+(m||0); }
+  // ══════════════════════════════════════════════════════════
+  //  جدول الحضور والغياب الشهري — القلب الجديد للنظام
+  // ══════════════════════════════════════════════════════════
+  function _renderAttendanceTable(t){
+    const tLessons = _teacherLessons(t.id);
+    if(tLessons.length===0){
+      return `
+        <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+          <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+            <i class="fas fa-table" style="margin-left:6px;"></i> جدول الحضور والغياب الشهري
+          </h3>
+          <p style="color:var(--text-muted);font-size:0.85rem;">لم يتم إضافة مجموعات للمدرس بعد.</p>
+        </div>`;
+    }
 
-  function _renderPayoutsTable(tid){
-    const payouts=_payouts.filter(p=>p.teacherId===tid).sort((a,b)=>new Date(b.date)-new Date(a.date));
-    if(!payouts.length) return '<p style="color:var(--text-muted);font-size:0.85rem;">لا توجد مدفوعات مسجّلة بعد.</p>';
+    const currentYM = _currentYearMonth();
+    const teacherLogs = _logs.filter(l=>l.teacherId===t.id && (l.date||'').substring(0,7)===currentYM);
+
+    // بناء صفوف الجدول — كل سجل حضور منفصل
+    // + صفوف فارغة لكل مجموعة لإضافة حصص جديدة
+    const groups = (t.assignments||[]);
+
     return `
-      <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
-        <thead><tr style="background:var(--bg-light);">
-          <th style="padding:8px;text-align:right;">التاريخ</th>
-          <th style="padding:8px;text-align:center;">المبلغ (ج)</th>
-          <th style="padding:8px;text-align:right;">ملاحظات</th>
-          <th style="padding:8px;"></th>
-        </tr></thead>
-        <tbody>
-          ${payouts.map(p=>`
-            <tr style="border-bottom:1px solid var(--bg-light);">
-              <td style="padding:8px;">${new Date(p.date).toLocaleDateString('ar-EG')}</td>
-              <td style="padding:8px;text-align:center;font-weight:800;color:#16a34a;">${(p.amount||0).toLocaleString('ar-EG')}</td>
-              <td style="padding:8px;color:var(--text-muted);">${_esc(p.notes||'—')}</td>
-              <td style="padding:8px;">
-                <button onclick="TeachersModule.deletePayout(${p.id})"
-                  style="background:#fef2f2;border:none;border-radius:6px;padding:3px 8px;cursor:pointer;color:#ef4444;font-size:0.75rem;">
-                  <i class="fas fa-trash"></i>
-                </button>
-              </td>
-            </tr>`).join('')}
-        </tbody>
-      </table>`;
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem;flex-wrap:wrap;gap:0.5rem;">
+          <h3 style="margin:0;font-size:0.95rem;font-weight:800;color:var(--primary);">
+            <i class="fas fa-table" style="margin-left:6px;"></i> جدول الحضور والغياب — ${_monthNameAr(currentYM)}
+          </h3>
+          <span style="background:#eff6ff;color:#4f46e5;border-radius:20px;padding:3px 12px;font-size:0.78rem;font-weight:700;">
+            ${teacherLogs.filter(l=>l.status==='attended').length} حصة منجزة هذا الشهر
+          </span>
+        </div>
+
+        <!-- إضافة حصة جديدة -->
+        <div style="background:#f0fdf4;border:1.5px dashed #86efac;border-radius:12px;padding:1rem;margin-bottom:1.2rem;">
+          <div style="font-weight:800;font-size:0.88rem;color:#16a34a;margin-bottom:0.75rem;">
+            <i class="fas fa-plus-circle" style="margin-left:5px;"></i> تسجيل حضور حصة جديدة
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:0.6rem;align-items:end;flex-wrap:wrap;">
+            <div>
+              <label style="font-size:0.78rem;font-weight:700;color:var(--text-muted);display:block;margin-bottom:3px;">المجموعة</label>
+              <select id="att-group-${t.id}" class="form-input" style="font-size:0.85rem;padding:0.5rem 0.7rem;">
+                <option value="">— اختر المجموعة —</option>
+                ${groups.map(a=>`<option value="${_esc(JSON.stringify({grade:a.grade,groupId:a.groupId||'',price:a.pricePerSession||0}))}">${_esc(gLabel(a.grade))} — ${_esc(grpName(a.groupId))} (${(a.pricePerSession||0).toLocaleString('ar-EG')} ج)</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.78rem;font-weight:700;color:var(--text-muted);display:block;margin-bottom:3px;">تاريخ الحصة (أنت تحدده)</label>
+              <input type="date" id="att-date-${t.id}" class="form-input" value="${new Date().toISOString().split('T')[0]}" style="font-size:0.85rem;padding:0.5rem 0.7rem;">
+            </div>
+            <div style="display:flex;gap:0.5rem;">
+              <button onclick="TeachersModule.registerAttendance(${t.id},'attended')"
+                style="background:#16a34a;color:white;border:none;border-radius:10px;padding:0.5rem 1rem;cursor:pointer;font-weight:700;font-size:0.85rem;white-space:nowrap;">
+                <i class="fas fa-check"></i> حاضر
+              </button>
+              <button onclick="TeachersModule.registerAttendance(${t.id},'absent')"
+                style="background:#ef4444;color:white;border:none;border-radius:10px;padding:0.5rem 1rem;cursor:pointer;font-weight:700;font-size:0.85rem;white-space:nowrap;">
+                <i class="fas fa-times"></i> غائب
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- الجدول التفصيلي -->
+        ${teacherLogs.length===0
+          ?`<p style="color:var(--text-muted);font-size:0.85rem;text-align:center;padding:1rem;">لم يتم تسجيل أي حصص هذا الشهر بعد.</p>`
+          :`<div style="overflow-x:auto;">
+              <table style="width:100%;border-collapse:collapse;font-size:0.82rem;min-width:550px;">
+                <thead>
+                  <tr style="background:var(--bg-light);">
+                    <th style="padding:8px 10px;text-align:right;">#</th>
+                    <th style="padding:8px 10px;text-align:right;">التاريخ</th>
+                    <th style="padding:8px 10px;text-align:center;">المجموعة</th>
+                    <th style="padding:8px 10px;text-align:center;">الصف</th>
+                    <th style="padding:8px 10px;text-align:center;">الحالة</th>
+                    <th style="padding:8px 10px;text-align:center;">قيمة الحصة</th>
+                    <th style="padding:8px 10px;text-align:center;">إجراء</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${teacherLogs.sort((a,b)=>(a.date||'').localeCompare(b.date||'')).map((l,i)=>{
+                    const price = _getPriceForLog(t,l);
+                    const statusCfg={
+                      attended:{bg:'#dcfce7',color:'#16a34a',label:'حاضر'},
+                      absent:{bg:'#fef2f2',color:'#ef4444',label:'غائب'},
+                      postponed:{bg:'#fefce8',color:'#a16207',label:'مؤجّل'},
+                      cancelled:{bg:'#f1f5f9',color:'#64748b',label:'ملغي'},
+                    }[l.status]||{bg:'#f1f5f9',color:'#64748b',label:l.status};
+                    return `
+                      <tr style="border-bottom:1px solid var(--bg-light);">
+                        <td style="padding:7px 10px;color:var(--text-muted);">${i+1}</td>
+                        <td style="padding:7px 10px;font-weight:700;">${new Date(l.date).toLocaleDateString('ar-EG')}</td>
+                        <td style="padding:7px 10px;text-align:center;">${_esc(grpName(l.groupId))}</td>
+                        <td style="padding:7px 10px;text-align:center;">${_esc(gLabel(l.grade))}</td>
+                        <td style="padding:7px 10px;text-align:center;">
+                          <span style="background:${statusCfg.bg};color:${statusCfg.color};border-radius:20px;padding:3px 10px;font-size:0.75rem;font-weight:700;">${statusCfg.label}</span>
+                        </td>
+                        <td style="padding:7px 10px;text-align:center;font-weight:700;color:${l.status==='attended'?'#4f46e5':'#9ca3af'};">
+                          ${l.status==='attended'?price.toLocaleString('ar-EG')+' ج':'—'}
+                        </td>
+                        <td style="padding:7px 10px;text-align:center;">
+                          <button onclick="TeachersModule.deleteAttendanceLog(${t.id},'${l.id}')"
+                            style="background:#fef2f2;border:none;border-radius:6px;padding:3px 8px;cursor:pointer;color:#ef4444;font-size:0.75rem;">
+                            <i class="fas fa-trash"></i>
+                          </button>
+                        </td>
+                      </tr>`;
+                  }).join('')}
+                </tbody>
+                <tfoot>
+                  <tr style="background:var(--bg-light);font-weight:800;">
+                    <td colspan="5" style="padding:9px 10px;">
+                      الإجمالي: ${teacherLogs.filter(l=>l.status==='attended').length} حصة حضور
+                    </td>
+                    <td style="padding:9px 10px;text-align:center;color:#4f46e5;">
+                      ${_calcMonthDue(t.id, currentYM).toLocaleString('ar-EG')} ج
+                    </td>
+                    <td></td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>`
+        }
+      </div>`;
   }
 
-  function _renderAdvancesTable(tid){
-    const advs=_advances.filter(a=>a.teacherId===tid).sort((a,b)=>new Date(b.date)-new Date(a.date));
-    if(!advs.length) return '<p style="color:var(--text-muted);font-size:0.85rem;">لا توجد سلف مسجّلة.</p>';
-    return `
-      <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
-        <thead><tr style="background:var(--bg-light);">
-          <th style="padding:8px;text-align:right;">التاريخ</th>
-          <th style="padding:8px;text-align:center;">المبلغ (ج)</th>
-          <th style="padding:8px;text-align:right;">السبب</th>
-          <th style="padding:8px;"></th>
-        </tr></thead>
-        <tbody>
-          ${advs.map(a=>`
-            <tr style="border-bottom:1px solid var(--bg-light);">
-              <td style="padding:8px;">${new Date(a.date).toLocaleDateString('ar-EG')}</td>
-              <td style="padding:8px;text-align:center;font-weight:800;color:#f59e0b;">${(a.amount||0).toLocaleString('ar-EG')}</td>
-              <td style="padding:8px;color:var(--text-muted);">${_esc(a.reason||'—')}</td>
-              <td style="padding:8px;">
-                <button onclick="TeachersModule.deleteAdvance(${a.id})"
-                  style="background:#fef2f2;border:none;border-radius:6px;padding:3px 8px;cursor:pointer;color:#ef4444;font-size:0.75rem;">
-                  <i class="fas fa-trash"></i>
-                </button>
-              </td>
-            </tr>`).join('')}
-        </tbody>
-      </table>`;
+  // ── تسجيل حضور/غياب حصة جديدة بتاريخ مخصص ──
+  async function registerAttendance(teacherId, status){
+    const t = _teachers.find(x=>x.id===teacherId);
+    if(!t) return;
+
+    const groupSel = document.getElementById(`att-group-${teacherId}`);
+    const dateSel  = document.getElementById(`att-date-${teacherId}`);
+
+    if(!groupSel?.value) return notify('يرجى اختيار المجموعة أولاً','error');
+    if(!dateSel?.value)  return notify('يرجى تحديد تاريخ الحصة','error');
+
+    let groupData;
+    try { groupData = JSON.parse(groupSel.value); } catch(e){ return notify('خطأ في بيانات المجموعة','error'); }
+
+    const { grade, groupId, price } = groupData;
+    const dateVal = dateSel.value; // YYYY-MM-DD
+
+    // منع التكرار: نفس المجموعة في نفس التاريخ
+    const duplicate = _logs.find(l=>
+      l.teacherId === teacherId &&
+      String(l.grade) === String(grade) &&
+      String(l.groupId||'') === String(groupId||'') &&
+      (l.date||'').substring(0,10) === dateVal
+    );
+
+    if(duplicate){
+      if(!confirm(`يوجد تسجيل سابق لهذه المجموعة بتاريخ ${dateVal}. هل تريد استبداله؟`)) return;
+      _logs = _logs.filter(l=>l.id!==duplicate.id);
+      try{ await _delFrom('teacherLogs', duplicate.id); }catch(e){}
+    }
+
+    const logId = Date.now();
+    const newLog = {
+      id: logId,
+      teacherId,
+      grade,
+      groupId: groupId||null,
+      status,
+      date: dateVal + 'T00:00:00.000Z',
+      priceSnapshot: parseFloat(price)||0,
+      createdAt: new Date().toISOString()
+    };
+
+    _logs.push(newLog);
+    try{
+      await _ensureStores();
+      await StorageEngine.save('teacherLogs', newLog);
+    }catch(e){ console.warn('[teachers] save log failed',e); }
+
+    const statusLabel = status==='attended' ? '✅ تم تسجيل الحضور' : '❌ تم تسجيل الغياب';
+    notify(statusLabel + ` — ${gLabel(grade)} (${grpName(groupId)}) — ${dateVal}`, 'success');
+
+    renderTeacherAccount(t);
   }
 
-  // ── Log Session ──
+  // ── حذف سجل حضور ──
+  async function deleteAttendanceLog(teacherId, logId){
+    if(!confirm('هل تريد حذف هذا التسجيل؟')) return;
+    _logs = _logs.filter(l=>String(l.id)!==String(logId));
+    try{ await _delFrom('teacherLogs', parseInt(logId)||logId); }catch(e){}
+    notify('تم حذف التسجيل','success');
+    const t=_teachers.find(x=>x.id===teacherId);
+    if(t) renderTeacherAccount(t);
+  }
+
+  // ── كشف الحصص التفصيلي ──
+  function _renderSessionStatement(t, attendedLogs){
+    const totalDue = _calcDue(t.id, attendedLogs);
+    return `
+      <div style="background:var(--bg-white);border-radius:16px;padding:1.2rem;margin-bottom:1.2rem;box-shadow:0 1px 6px rgba(0,0,0,0.06);">
+        <h3 style="margin:0 0 1rem;font-size:0.95rem;font-weight:800;color:var(--primary);">
+          <i class="fas fa-file-invoice" style="margin-left:6px;"></i> كشف الحصص التفصيلي (الفترة المختارة)
+        </h3>
+        <div style="overflow-x:auto;">
+          <table style="width:100%;border-collapse:collapse;font-size:0.82rem;min-width:600px;">
+            <thead>
+              <tr style="background:var(--bg-light);">
+                <th style="padding:8px 10px;text-align:right;border-radius:8px 0 0 8px;">التاريخ</th>
+                <th style="padding:8px 10px;text-align:center;">المجموعة</th>
+                <th style="padding:8px 10px;text-align:center;">الصف</th>
+                <th style="padding:8px 10px;text-align:center;">سعر الحصة</th>
+                <th style="padding:8px 10px;text-align:left;border-radius:0 8px 8px 0;">القيمة</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${attendedLogs.sort((a,b)=>(a.date||'').localeCompare(b.date||'')).map(l=>{
+                const price = _getPriceForLog(t, l);
+                return `
+                  <tr style="border-bottom:1px solid var(--bg-light);">
+                    <td style="padding:7px 10px;">${new Date(l.date).toLocaleDateString('ar-EG')}</td>
+                    <td style="padding:7px 10px;text-align:center;">${_esc(grpName(l.groupId))}</td>
+                    <td style="padding:7px 10px;text-align:center;">${_esc(gLabel(l.grade))}</td>
+                    <td style="padding:7px 10px;text-align:center;">${price.toLocaleString('ar-EG')} ج</td>
+                    <td style="padding:7px 10px;text-align:left;font-weight:700;color:var(--primary);">${price.toLocaleString('ar-EG')} ج</td>
+                  </tr>`;
+              }).join('')}
+              ${attendedLogs.length===0?`
+                <tr><td colspan="5" style="padding:1.5rem;text-align:center;color:var(--text-muted);">لا توجد حصص مسجّلة في هذه الفترة</td></tr>`:''
+              }
+            </tbody>
+            <tfoot>
+              <tr style="background:var(--bg-light);font-weight:800;">
+                <td colspan="3" style="padding:9px 10px;border-radius:8px 0 0 8px;">الإجمالي (${attendedLogs.length} حصة)</td>
+                <td style="padding:9px 10px;text-align:center;">---</td>
+                <td style="padding:9px 10px;text-align:left;color:var(--primary);font-size:0.95rem;border-radius:0 8px 8px 0;">${totalDue.toLocaleString('ar-EG')} ج</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  بداية شهر جديد — ترحيل وحفظ المستحقات
+  // ══════════════════════════════════════════════════════════
+  function showNewMonthModal(teacherId){
+    const t=_teachers.find(x=>x.id===teacherId);
+    if(!t) return;
+
+    const currentYM = _currentYearMonth();
+    const currentMonthLogs = _logs.filter(l=>l.teacherId===teacherId && l.status==='attended' && (l.date||'').substring(0,7)===currentYM);
+    const currentMonthDue = _calcMonthDue(teacherId, currentYM);
+    const monthLabel = _monthNameAr(currentYM);
+
+    // الشهر القادم
+    const [y,m] = currentYM.split('-').map(Number);
+    const nextM = m===12 ? 1 : m+1;
+    const nextY = m===12 ? y+1 : y;
+    const nextYM = `${nextY}-${String(nextM).padStart(2,'0')}`;
+
+    const modal=_mkModal('new-month-modal',`
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1.2rem;">
+        <h2 style="margin:0;color:#7c3aed;font-size:1.1rem;font-weight:800;">
+          <i class="fas fa-calendar-plus" style="margin-left:8px;"></i> بداية شهر جديد — ${_esc(t.name)}
+        </h2>
+        <button onclick="window._closeModal('new-month-modal')" style="background:var(--bg-light);border:none;border-radius:50%;width:36px;height:36px;cursor:pointer;"><i class="fas fa-times"></i></button>
+      </div>
+
+      <div style="background:#faf5ff;border:1.5px solid #d8b4fe;border-radius:12px;padding:1rem;margin-bottom:1.2rem;">
+        <div style="font-weight:800;font-size:0.9rem;color:#7c3aed;margin-bottom:0.75rem;">
+          <i class="fas fa-archive" style="margin-left:5px;"></i> سيتم ترحيل وحفظ بيانات شهر ${_esc(monthLabel)}:
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem;">
+          <div style="background:white;border-radius:10px;padding:0.75rem;text-align:center;">
+            <div style="font-size:1.3rem;font-weight:800;color:#4f46e5;">${currentMonthLogs.length}</div>
+            <div style="font-size:0.72rem;color:var(--text-muted);">عدد الحصص المنجزة</div>
+          </div>
+          <div style="background:white;border-radius:10px;padding:0.75rem;text-align:center;">
+            <div style="font-size:1.3rem;font-weight:800;color:#16a34a;">${currentMonthDue.toLocaleString('ar-EG')} ج</div>
+            <div style="font-size:0.72rem;color:var(--text-muted);">إجمالي مستحقات الشهر</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="background:#fff7ed;border:1.5px solid #fed7aa;border-radius:12px;padding:0.85rem;margin-bottom:1.2rem;font-size:0.85rem;color:#9a3412;">
+        <i class="fas fa-info-circle" style="margin-left:5px;"></i>
+        <strong>ملاحظة:</strong> لن يتم حذف أي بيانات. سيتم حفظ مستحقات ${_esc(monthLabel)} في قسم "المستحقات الشهرية" وإنشاء جدول نظيف لشهر ${_esc(_monthNameAr(nextYM))}.
+      </div>
+
+      <div style="margin-bottom:1.2rem;">
+        <label style="font-weight:700;font-size:0.85rem;display:block;margin-bottom:4px;">ملاحظات (اختياري)</label>
+        <input id="nm-notes" type="text" class="form-input" placeholder="مثال: تم التسوية في نهاية الشهر">
+      </div>
+
+      <div style="display:flex;gap:0.75rem;justify-content:flex-end;">
+        <button onclick="window._closeModal('new-month-modal')" class="btn" style="background:var(--bg-light);border:1px solid var(--border);">إلغاء</button>
+        <button onclick="TeachersModule._confirmNewMonth(${teacherId},'${currentYM}')"
+          style="background:linear-gradient(135deg,#7c3aed,#4f46e5);color:white;border:none;border-radius:10px;padding:0.6rem 2rem;cursor:pointer;font-weight:700;">
+          <i class="fas fa-check"></i> تأكيد البدء بشهر جديد
+        </button>
+      </div>
+    `);
+    document.body.appendChild(modal);
+  }
+
+  async function _confirmNewMonth(teacherId, yearMonth){
+    const t=_teachers.find(x=>x.id===teacherId);
+    if(!t) return;
+
+    const notes = document.getElementById('nm-notes')?.value.trim();
+    const currentMonthLogs = _logs.filter(l=>l.teacherId===teacherId && l.status==='attended' && (l.date||'').substring(0,7)===yearMonth);
+    const monthDue = _calcMonthDue(teacherId, yearMonth);
+
+    // حفظ المستحقات الشهرية
+    const dueRecord = {
+      id: Date.now(),
+      teacherId,
+      yearMonth,
+      amount: monthDue,
+      sessionCount: currentMonthLogs.length,
+      notes: notes||'',
+      archivedAt: new Date().toISOString()
+    };
+
+    _monthlyDues.push(dueRecord);
+    try{
+      await _ensureStores();
+      await StorageEngine.save('teacherMonthlyDues', dueRecord);
+    }catch(e){ console.warn('[teachers] save monthlyDue failed',e); }
+
+    window._closeModal('new-month-modal');
+    notify(`✅ تم ترحيل مستحقات ${_monthNameAr(yearMonth)} (${monthDue.toLocaleString('ar-EG')} ج) وحفظها بنجاح`,'success');
+
+    renderTeacherAccount(t);
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  Log Session (legacy — للتوافق مع teachers-attendance.js)
+  // ══════════════════════════════════════════════════════════
   async function logSession(teacherId, lessonId, status, grade, groupId, hallId=''){
     const today=new Date().toISOString().split('T')[0];
     const old=_logs.find(l=>l.teacherId===teacherId&&l.lessonId===lessonId&&l.date?.startsWith(today));
     if(old){ _logs=_logs.filter(l=>l.id!==old.id); await _delFrom('teacherLogs',old.id); }
 
-    const log={id:Date.now(),teacherId,lessonId,status,grade,groupId:groupId||null,hallId:hallId||null,date:new Date().toISOString()};
+    const t=_teachers.find(x=>x.id===teacherId);
+    const price = t ? _getPriceForLog(t, {grade, groupId}) : 0;
+
+    const log={id:Date.now(),teacherId,lessonId,status,grade,groupId:groupId||null,hallId:hallId||null,date:new Date().toISOString(),priceSnapshot:price};
     _logs.push(log);
     await StorageEngine.save('teacherLogs', log);
     notify({attended:'✓ تم تسجيل الحضور',absent:'✕ تم تسجيل الغياب',postponed:'⏸ تم تسجيل التأجيل',cancelled:'تم إلغاء الحصة'}[status]||'تم التسجيل','success');
-    const t=_teachers.find(x=>x.id===teacherId);
     if(t) renderTeacherAccount(t);
   }
 
@@ -833,19 +1410,69 @@
     if(_activeTeacherId){ const t=_teachers.find(x=>x.id===_activeTeacherId); if(t) renderTeacherAccount(t); }
   }
 
-  // ── Build options ──
   function _buildGradeOpts(sel=''){
-    if(typeof GRADE_MAP==='undefined'&&window.gradesList)
-      return (window.gradesList||[]).map(g=>`<option value="${_esc(String(g.id))}" ${String(g.id)===String(sel)?'selected':''}>${_esc(g.name)}</option>`).join('');
-    if(typeof GRADE_MAP!=='undefined')
-      return GRADE_MAP.map(g=>`<option value="${g.systemCode}" ${g.systemCode===sel?'selected':''}>${g.label}</option>`).join('');
-    return '';
+    return window.GradeGroupLinkSystem.buildGradeOptions(sel);
   }
-  function _buildGroupOpts(grade='',selId=''){
-    const groups=(window.db&&db.groups)||[];
-    const filtered=grade?groups.filter(g=>String(g.grade)===String(grade)):groups;
-    return filtered.map(g=>`<option value="${g.id}" ${String(g.id)===String(selId)?'selected':''}>${_esc(g.name)}</option>`).join('');
+
+  // ── Table helpers ──
+  function _renderPayoutsTable(tid){
+    const payouts=_payouts.filter(p=>p.teacherId===tid).sort((a,b)=>new Date(b.date)-new Date(a.date));
+    if(!payouts.length) return '<p style="color:var(--text-muted);font-size:0.85rem;">لا توجد مدفوعات مسجّلة بعد.</p>';
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+        <thead><tr style="background:var(--bg-light);">
+          <th style="padding:8px;text-align:right;">التاريخ</th>
+          <th style="padding:8px;text-align:center;">المبلغ (ج)</th>
+          <th style="padding:8px;text-align:right;">ملاحظات</th>
+          <th style="padding:8px;"></th>
+        </tr></thead>
+        <tbody>
+          ${payouts.map(p=>`
+            <tr style="border-bottom:1px solid var(--bg-light);">
+              <td style="padding:8px;">${new Date(p.date).toLocaleDateString('ar-EG')}</td>
+              <td style="padding:8px;text-align:center;font-weight:800;color:#16a34a;">${(p.amount||0).toLocaleString('ar-EG')}</td>
+              <td style="padding:8px;color:var(--text-muted);">${_esc(p.notes||'—')}</td>
+              <td style="padding:8px;">
+                <button onclick="TeachersModule.deletePayout(${p.id})"
+                  style="background:#fef2f2;border:none;border-radius:6px;padding:3px 8px;cursor:pointer;color:#ef4444;font-size:0.75rem;">
+                  <i class="fas fa-trash"></i>
+                </button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
   }
+
+  function _renderAdvancesTable(tid){
+    const advs=_advances.filter(a=>a.teacherId===tid).sort((a,b)=>new Date(b.date)-new Date(a.date));
+    if(!advs.length) return '<p style="color:var(--text-muted);font-size:0.85rem;">لا توجد سلف مسجّلة.</p>';
+    return `
+      <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+        <thead><tr style="background:var(--bg-light);">
+          <th style="padding:8px;text-align:right;">التاريخ</th>
+          <th style="padding:8px;text-align:center;">المبلغ (ج)</th>
+          <th style="padding:8px;text-align:right;">السبب</th>
+          <th style="padding:8px;"></th>
+        </tr></thead>
+        <tbody>
+          ${advs.map(a=>`
+            <tr style="border-bottom:1px solid var(--bg-light);">
+              <td style="padding:8px;">${new Date(a.date).toLocaleDateString('ar-EG')}</td>
+              <td style="padding:8px;text-align:center;font-weight:800;color:#f59e0b;">${(a.amount||0).toLocaleString('ar-EG')}</td>
+              <td style="padding:8px;color:var(--text-muted);">${_esc(a.reason||'—')}</td>
+              <td style="padding:8px;">
+                <button onclick="TeachersModule.deleteAdvance(${a.id})"
+                  style="background:#fef2f2;border:none;border-radius:6px;padding:3px 8px;cursor:pointer;color:#ef4444;font-size:0.75rem;">
+                  <i class="fas fa-trash"></i>
+                </button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  }
+
+  // ── Helpers ──
+  function toMin(t){ const[h,m]=(t||'00:00').split(':').map(Number); return h*60+(m||0); }
 
   // ── Modal factory ──
   function _mkModal(id,content){
@@ -854,6 +1481,16 @@
     m.id=id;
     m.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);backdrop-filter:blur(3px);overflow-y:auto;';
     m.innerHTML=`<div style="background:var(--bg-white,#fff);border-radius:20px;padding:2rem;max-width:680px;width:95%;max-height:92vh;overflow-y:auto;box-shadow:0 25px 60px rgba(0,0,0,0.3);direction:rtl;font-family:inherit;margin:auto;">${content}</div>`;
+    m.addEventListener('click',e=>{if(e.target===m)m.remove();});
+    return m;
+  }
+
+  function _mkModalWide(id,content){
+    const ex=document.getElementById(id); if(ex) ex.remove();
+    const m=document.createElement('div');
+    m.id=id;
+    m.style.cssText='position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.55);backdrop-filter:blur(3px);overflow-y:auto;';
+    m.innerHTML=`<div style="background:var(--bg-white,#fff);border-radius:20px;padding:2rem;max-width:920px;width:96%;max-height:92vh;overflow-y:auto;box-shadow:0 25px 60px rgba(0,0,0,0.3);direction:rtl;font-family:inherit;margin:auto;">${content}</div>`;
     m.addEventListener('click',e=>{if(e.target===m)m.remove();});
     return m;
   }
@@ -870,18 +1507,26 @@
     openTeacherAccount,
     backToTeachersList,
     logSession,
+    registerAttendance,
+    deleteAttendanceLog,
+    showNewMonthModal,
+    _confirmNewMonth,
     showPayoutModal,
     showAdvanceModal,
     deletePayout,
     deleteAdvance,
     setFilter,
     setCustomRange,
-    _addAssignRow,
-    _onGradeChange,
+    _toggleGrade,
+    _addGroupBlock,
+    _removeGroupBlock,
+    _updateBlockField,
+    _toggleDay,
+    _updateSlotTime,
     _saveTeacher,
     _confirmPayout,
     _confirmAdvance,
   };
 
-  console.log('[teachers.js] v2.0 ✅ نظام حسابات المدرسين المتكامل جاهز');
+  console.log('[teachers.js] v4.0 ✅ نظام حسابات المدرسين + جدول حضور شهري + مستحقات شهرية جاهز');
 })();

@@ -304,7 +304,7 @@ const StorageEngine = {
             //  attendance / payments تشير إلى enrollmentId وليس groupId فقط.
             // ─────────────────────────────────────────────────────────────
             // v9: إضافة جدولَي canteenItems و canteenSales لنظام الكانتين
-            const request = indexedDB.open("EduMasterLargeDB", 10);
+            const request = indexedDB.open("EduMasterLargeDB", 11);
             request.onerror = (e) => reject("IndexedDB error: " + e.target.errorCode);
             request.onupgradeneeded = (e) => {
                 const db = e.target.result;
@@ -361,6 +361,23 @@ const StorageEngine = {
                     const csStore = db.createObjectStore("canteenSales", { keyPath: "id" });
                     csStore.createIndex("itemId", "itemId", { unique: false });
                     csStore.createIndex("date",   "date",   { unique: false });
+                }
+
+                // ── جداول المدرسين (v11) ──
+                if (!db.objectStoreNames.contains("teachers")) {
+                    db.createObjectStore("teachers", { keyPath: "id" });
+                }
+                if (!db.objectStoreNames.contains("teacherLogs")) {
+                    const tlStore = db.createObjectStore("teacherLogs", { keyPath: "id" });
+                    tlStore.createIndex("teacherId", "teacherId", { unique: false });
+                }
+                if (!db.objectStoreNames.contains("teacherMonthlyDues")) {
+                    const tmdStore = db.createObjectStore("teacherMonthlyDues", { keyPath: "id" });
+                    tmdStore.createIndex("teacherId", "teacherId", { unique: false });
+                }
+                if (!db.objectStoreNames.contains("teacherPayouts")) {
+                    const tpStore = db.createObjectStore("teacherPayouts", { keyPath: "id" });
+                    tpStore.createIndex("teacherId", "teacherId", { unique: false });
                 }
 
                 // ── باقي الجداول ──
@@ -2892,7 +2909,7 @@ async function handleAddGroup() {
     const sysGrade = gradeIdToSystemCode(activeGrade);
 
     // Create group
-    const newGroup = { id: Date.now(), name, time, grade: sysGrade };
+    const newGroup = { id: Date.now(), name, time, grade: sysGrade, cycleId: (window.db && db.settings && db.settings.activeCycle) || null };
     db.groups.push(newGroup);
 
     // حفظ دائم في IndexedDB مع انتظار اكتمال الكتابة (نحفظ المجموعة الجديدة فقط)
@@ -3098,7 +3115,8 @@ function refreshGroupContexts() {
     if (typeof initIDCardsSection === 'function') initIDCardsSection();
 
     if (typeof initFollowupSection === 'function') initFollowupSection();
-    if (typeof initFastGrading === 'function') initFastGrading();
+    // تحديث قوائم الرصد السريع فقط (بدون تشغيل الكاميرا) حتى لا تظهر رسائل خطأ الكاميرا عند حفظ المدرسين أو المجموعات
+    if (typeof refreshFastGradingDropdowns === 'function') refreshFastGradingDropdowns();
     if (typeof initStudentGroups === 'function') initStudentGroups();
     if (typeof initAbsenceGroupFilter === 'function') initAbsenceGroupFilter();
 
@@ -5509,7 +5527,9 @@ function exitPortalMode() {
 // fastGradingScanner already declared in global state section above
 let currentFastStudent = null;
 
-function initFastGrading() {
+// تحديث قوائم الاختبارات والمجموعات في قسم الرصد السريع دون المساس بالكاميرا
+// يُستدعى من refreshGroupContexts لتحديث القوائم فقط حتى لو القسم غير مفعّل
+function refreshFastGradingDropdowns() {
     const examSelect = document.getElementById('fast-exam-select');
     const groupSelect = document.getElementById('fast-group-select');
     if (!examSelect || !groupSelect) return;
@@ -5524,11 +5544,19 @@ function initFastGrading() {
     groupSelect.innerHTML = '<option value="">-- اختر المجموعة --</option>' +
         '<option value="all">كل مجموعات المرحلة (يوم جماعي)</option>' +
         groups.map(g => `<option value="${g.id}" ${String(g.id) === String(currentGroupId) ? 'selected' : ''}>${g.name}</option>`).join('');
+}
+
+function initFastGrading() {
+    const examSelect = document.getElementById('fast-exam-select');
+    const groupSelect = document.getElementById('fast-group-select');
+    if (!examSelect || !groupSelect) return;
+
+    // تحديث القوائم
+    refreshFastGradingDropdowns();
 
     // AUTO SELECT LAST EXAM if none selected
+    const exams = db.exams.filter(e => String(e.grade) === String(currentGrade));
     if (!examSelect.value && exams.length > 0) {
-        examSelect.value = exams[0].id; // Usually first is latest in some contexts, but let's check reverse
-        // Alternatively, if they are sorted by date (id is Date.now), the last one is exams[exams.length-1]
         examSelect.value = exams[exams.length - 1].id;
         updateFastExamMax();
     }
@@ -5546,6 +5574,7 @@ function initFastGrading() {
     renderFastHistory();
     renderFastPendingList();
 
+    // تشغيل الكاميرا — فقط عند فتح هذا القسم مباشرة (وليس من refreshGroupContexts)
     if (!fastGradingScanner) fastGradingScanner = new Html5Qrcode("fast-reader");
     fastGradingScanner.start({ facingMode: "environment" }, { fps: 20, qrbox: 250 }, processFastScan).catch(err => {
         console.error("Scanner failed", err);
@@ -11248,6 +11277,148 @@ function gradeIdToSystemCode(rawId) {
     return g;
 }
 
+// ══════════════════════════════════════════════════════════════
+//  نظام موحّد لربط الصف بالمجموعة (Grade ↔ Group Link System)
+//  ─────────────────────────────────────────────────────────────
+//  إعادة بناء كاملة من الصفر لمكوّن اختيار "الصف ← المجموعة"، عشان
+//  إدارة القاعات وإدارة المدرسين يستخدموا نفس الكود بالظبط بدل نسختين
+//  منفصلتين. كل صف له ID رئيسي ثابت (gradeId) — من رقم الصف الأصلي
+//  (101-303) عن طريق gradeIdToSystemCode()، أو من categoryId (1-12)
+//  لو نظام الفئات المركزي (category-system.js) محمّل. كل مجموعة بتاخد
+//  نفس الـ gradeId في حقل "grade" وقت إنشائها — وده رابطها بالصف الأب.
+// ══════════════════════════════════════════════════════════════
+const GradeGroupLinkSystem = (function () {
+
+    // مفتاح مطابقة موحّد لأي قيمة (ID رقمي قديم / systemCode / categoryId).
+    // بيتحقق من تطابق systemCode مباشر الأول لتفادي تصادم أكواد الثانوي
+    // '1'/'2'/'3' مع categoryId رقم 1/2/3 (أولى/ثانية/ثالثة ابتدائي).
+    function keyOf(value) {
+        const raw = String(value == null ? '' : value).trim();
+        if (!raw) return '';
+        if (Array.isArray(window.CATEGORY_TABLE)) {
+            const bySystemCode = window.CATEGORY_TABLE.find(c => String(c.systemCode) === raw);
+            if (bySystemCode) return `cat:${bySystemCode.categoryId}`;
+        }
+        const isAmbiguousDigit = /^([1-9]|1[0-2])$/.test(raw);
+        if (!isAmbiguousDigit && typeof window.toCategoryId === 'function') {
+            const catId = window.toCategoryId(raw);
+            if (catId) return `cat:${catId}`;
+        }
+        const sys = gradeIdToSystemCode(raw);
+        if (sys) return `sys:${sys}`;
+        return `raw:${raw}`;
+    }
+
+    // الـ ID الرئيسي الثابت لكل صف (نفس systemCode المستخدم بالفعل في
+    // كل بيانات الطلاب/الحصص/الاختبارات، عشان يفضل كل شيء متوافق)
+    function gradeIdOf(gradeListEntry) {
+        return gradeIdToSystemCode(String(gradeListEntry.id));
+    }
+
+    // الربط الفعلي بين المجموعة وصفها الأب — عن طريق ID مش اسم
+    function groupParentKey(group) {
+        if (!group) return '';
+        if (group.categoryId) return `cat:${Number(group.categoryId)}`;
+        return keyOf(group.gradeId || group.grade || '');
+    }
+
+    function esc(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ── قائمة الصفوف (تُستخدم في كل الشاشات) ─────────────────
+    function buildGradeOptions(selectedGradeId = '') {
+        const list = Array.isArray(window.gradesList) ? window.gradesList : [];
+        const selKey = keyOf(selectedGradeId);
+        return list.map(g => {
+            const gid = gradeIdOf(g);
+            const isSel = selKey !== '' && keyOf(gid) === selKey;
+            return `<option value="${esc(gid)}" ${isSel ? 'selected' : ''}>${esc(g.name)}</option>`;
+        }).join('');
+    }
+
+    // ── قائمة المجموعات التابعة لصف معيّن فقط ─────────────────
+    // placeholderText: نص أول خيار — مرّر '' لإلغائه
+    function buildGroupOptions(gradeId = '', selectedGroupId = '', placeholderText = '-- كل المجموعات --') {
+        const all = (window.db && Array.isArray(db.groups)) ? db.groups : [];
+        const head = placeholderText ? `<option value="">${esc(placeholderText)}</option>` : '';
+
+        if (!gradeId) {
+            if (all.length === 0) {
+                return `<option value="" disabled selected>⚠️ لا توجد مجموعات مضافة بعد</option>`;
+            }
+            return head + all.map(g =>
+                `<option value="${g.id}" ${String(g.id) === String(selectedGroupId) ? 'selected' : ''}>${esc(g.name)}</option>`
+            ).join('');
+        }
+
+        const wantedKey = keyOf(gradeId);
+        const filtered = all.filter(g => {
+            const gKey = groupParentKey(g);
+            return gKey && wantedKey && gKey === wantedKey;
+        });
+
+        if (filtered.length === 0) {
+            // ⚠️ لا مجموعات حقيقية لهذا الصف — بلا أي بديل وهمي
+            return `<option value="" disabled selected>⚠️ لا توجد مجموعات مضافة لهذا الصف</option>`;
+        }
+        return head + filtered.map(g =>
+            `<option value="${g.id}" ${String(g.id) === String(selectedGroupId) ? 'selected' : ''}>${esc(g.name)}</option>`
+        ).join('');
+    }
+
+    // ── مجموعات صف معيّن (أسماء فقط) — لاقتراحات الكتابة الحرة ──
+    function listGroupNamesForGrade(gradeId) {
+        const all = (window.db && Array.isArray(db.groups)) ? db.groups : [];
+        if (!gradeId) return [];
+        const wantedKey = keyOf(gradeId);
+        return all
+            .filter(g => groupParentKey(g) === wantedKey)
+            .map(g => g.name)
+            .filter(Boolean);
+    }
+
+    // ── الدخول الحر بكتابة اسم المجموعة ────────────────────────
+    // لو فيه مجموعة بنفس الاسم (بعد تنضيف المسافات) في نفس الصف
+    // فعلاً، بيرجعها كما هي (نفس الـ ID، مفيش تكرار). لو مش موجودة،
+    // بينشئها فوراً بنفس مسار handleAddGroup() تماماً (نفس شكل
+    // السجل + StorageEngine.save + مزامنة Firebase)، عشان تفضل كل
+    // الشاشات التانية (عدد الطلاب، بوابة الحضور...) شغالة صح.
+    async function findOrCreateGroupByName(gradeId, rawName) {
+        const name = String(rawName || '').trim();
+        if (!gradeId || !name) return null;
+
+        const all = (window.db && Array.isArray(db.groups)) ? db.groups : [];
+        const wantedKey = keyOf(gradeId);
+        const existing = all.find(g =>
+            groupParentKey(g) === wantedKey &&
+            String(g.name || '').trim().toLowerCase() === name.toLowerCase()
+        );
+        if (existing) return existing;
+
+        const newGroup = { id: Date.now(), name, time: '', grade: gradeId, cycleId: null };
+        all.push(newGroup);
+        if (window.db) db.groups = all;
+
+        try {
+            if (typeof StorageEngine !== 'undefined' && StorageEngine.save) {
+                await StorageEngine.save('groups', [newGroup]);
+            }
+        } catch (e) {
+            console.warn('[findOrCreateGroupByName] فشل حفظ المجموعة محلياً:', e);
+        }
+        try { if (typeof window.syncGroupToCloud === 'function') window.syncGroupToCloud(newGroup); } catch (e) { /* اتصال لاحق هيحلها */ }
+        if (typeof renderGroups === 'function') renderGroups();
+        if (typeof refreshGroupContexts === 'function') refreshGroupContexts();
+
+        return newGroup;
+    }
+
+    return { keyOf, gradeIdOf, groupParentKey, buildGradeOptions, buildGroupOptions, listGroupNamesForGrade, findOrCreateGroupByName };
+})();
+window.GradeGroupLinkSystem = GradeGroupLinkSystem;
+
 function mapOfflineGradeToPlatformGrade(gradeId) {
     const grade = String(gradeId || '');
     const direct = { '301': '1', '302': '2', '303': '3', '203': 'prep3' };
@@ -12574,6 +12745,18 @@ async function downloadPaymentsFromCloud() {
         if (typeof renderProgramSettings === 'function') renderProgramSettings();
         // ── تحديث أرشيف الحضور والغياب بعد الاستلام ──
         if (typeof generateAbsenceReport === 'function') generateAbsenceReport();
+        // ── تحديث إدارة القاعات وحسابات المدرسين بعد الاستلام ──
+        // (halls/lessons/teachers موجودة بالفعل ضمن DEVICE_SYNC_FULL_TABLES وتُحفظ
+        //  في IndexedDB بنجاح، لكن كانت شاشتا "إدارة القاعات" و"حسابات المدرسين"
+        //  لا تُعيدان القراءة من القاعدة إلا عند فتحهما يدوياً من جديد)
+        if (window.HallsModule && typeof window.HallsModule.init === 'function') {
+            window.HallsModule.init();
+        }
+        if (window.TeachersModule && typeof window.TeachersModule.initTeachersSection === 'function') {
+            window.TeachersModule.initTeachersSection();
+        } else if (window.TeachersModule && typeof window.TeachersModule.renderTeachersGrid === 'function') {
+            window.TeachersModule.renderTeachersGrid();
+        }
     } catch (err) {
         console.error('[DeviceSync] downloadFullData:', err);
         showNotification('❌ خطأ أثناء استلام كل البيانات: ' + err.message, 'error');
@@ -13009,6 +13192,7 @@ window.onload = async () => {
     // ويُصلح أي ربط خاطئ للطلاب من مزامنات سابقة
     try {
         await seedBookingGroups();
+        await repairGroupGradeLinks();
         await repairGroupBindings();
     } catch (e) {
         console.warn('[startup] seedBookingGroups/repairGroupBindings:', e);
@@ -15179,6 +15363,91 @@ async function repairGroupBindings() {
 
     return { fixedCount, orphanCount };
 }
+
+// ── إصلاح ربط المجموعات بالصفوف (Grade ↔ Group linkage) ───────
+// بنفس فكرة repairGroupBindings فوق: بتتأكد إن حقل "grade" في كل مجموعة
+// مطابق للشكل القانوني (systemCode) اللي كل شاشات النظام (إدارة القاعات،
+// إدارة المدرسين، بوابة الحضور) بتقارن بيه. ده بيغطي مجموعات قديمة
+// اتحفظت بكود منصة قديم أو اسم عربي أو ID رقمي خام قبل توحيد النظام —
+// بدون حذف أي مجموعة أو طالب مهما حصل، وبدون أي بيانات وهمية.
+//
+// ⚠️ مهم: مش بنستخدم toCategoryId() مباشرة من category-system.js لوحدها،
+// لأن فيها تصادم حقيقي — أكواد الصفوف الثانوية '1'/'2'/'3' بتتلخبط مع
+// categoryId رقم 1/2/3 (اللي هما أولى/ثانية/ثالثة ابتدائي) لو اتحسبت
+// كرقم مباشر. فبنتأكد الأول من تطابق مباشر بالـ systemCode الحالي قبل
+// أي تحويل تاني، بالظبط زي ما gradeKey() في halls.js بتعمل.
+async function repairGroupGradeLinks() {
+    if (!StorageEngine.db) await StorageEngine.init();
+    db.groups = await StorageEngine.getAll('groups');
+
+    // الصفوف المعروفة فعلياً في النظام دلوقتي
+    const knownCodes = new Set(
+        Array.isArray(window.CATEGORY_TABLE)
+            ? window.CATEGORY_TABLE.map(c => c.systemCode)
+            : (window.gradesList || []).map(g => (typeof gradeIdToSystemCode === 'function') ? gradeIdToSystemCode(String(g.id)) : String(g.id))
+    );
+
+    function resolveCanonical(raw) {
+        const str = String(raw || '').trim();
+        if (!str) return '';
+        // 1) تطابق مباشر بالـ systemCode الحالي (آمن من تصادم '1'/'2'/'3')
+        if (Array.isArray(window.CATEGORY_TABLE)) {
+            const bySys = window.CATEGORY_TABLE.find(c => String(c.systemCode) === str);
+            if (bySys) return bySys.systemCode;
+        }
+        // 2) جدول grade-mapping.js (يغطي الـ IDs الرقمية القديمة 101-303)
+        const viaMapping = (typeof gradeIdToSystemCode === 'function') ? gradeIdToSystemCode(str) : str;
+        if (viaMapping !== str && knownCodes.has(viaMapping)) return viaMapping;
+        // 3) أسماء عربية قديمة/أكواد منصة أخرى — فقط لو مش رقم مفرد من 1
+        // لـ 12 (عشان نتفادى تصادم toCategoryId مع أكواد الثانوي)
+        const isAmbiguousDigit = /^([1-9]|1[0-2])$/.test(str);
+        if (!isAmbiguousDigit && typeof toCategoryId === 'function' && typeof categoryToSystemCode === 'function') {
+            const catId = toCategoryId(str);
+            if (catId) {
+                const sys = categoryToSystemCode(catId);
+                if (sys) return sys;
+            }
+        }
+        return knownCodes.has(viaMapping) ? viaMapping : '';
+    }
+
+    const groupsToFix = [];
+    const orphaned = [];
+    let fixedCount = 0;
+
+    for (const g of db.groups) {
+        const raw = g.grade || g.gradeId || '';
+        const canonical = resolveCanonical(raw);
+        if (!canonical) {
+            orphaned.push(g);
+            console.warn(`[repairGroupGradeLinks] مجموعة "${g.name}" (id: ${g.id}) بصف غير معروف: "${raw}" — لم تُحذف، تحتاج مراجعة يدوية`);
+            continue;
+        }
+        if (String(g.grade) !== canonical) {
+            g.grade = canonical; // توحيد الشكل فقط — الاسم والـ ID والطلاب زي ما هم
+            groupsToFix.push(g);
+            fixedCount++;
+        }
+    }
+
+    if (groupsToFix.length > 0) {
+        await StorageEngine.save('groups', groupsToFix);
+        if (typeof renderGroups === 'function') renderGroups();
+        if (typeof syncUIWithContext === 'function') syncUIWithContext();
+        if (window.HallsModule && typeof window.HallsModule.init === 'function') window.HallsModule.init();
+        if (window.TeachersModule && typeof window.TeachersModule.initTeachersSection === 'function') window.TeachersModule.initTeachersSection();
+    }
+
+    console.log('[repairGroupGradeLinks]', { fixedCount, orphanCount: orphaned.length });
+    if (fixedCount > 0) {
+        if (typeof showNotification === 'function') showNotification(`تم توحيد ${fixedCount} مجموعة مع نظام الصفوف تلقائياً`, 'success');
+    } else if (orphaned.length > 0) {
+        if (typeof showNotification === 'function') showNotification(`⚠️ ${orphaned.length} مجموعة بصف غير معروف — راجعها يدوياً في إدارة المجموعات`, 'info');
+    }
+
+    return { fixedCount, orphanCount: orphaned.length };
+}
+window.repairGroupGradeLinks = repairGroupGradeLinks;
 
 // ── تشغيل الإصلاح تلقائياً بعد كل مزامنة ──────────────────────
 const _origImportBooking = importBookingStudents;

@@ -9,7 +9,7 @@
 //    5. أو: يُطبَّق تلقائياً بعد 10 ثوانٍ بدون تدخّل
 // ============================================================
 
-const CACHE_VERSION = 'elmohandes-math-pwa-v1';
+const CACHE_VERSION = 'elmohandes-math-pwa-v3';
 
 const APP_SHELL = [
   './',
@@ -23,6 +23,7 @@ const APP_SHELL = [
   './receive-exams.js',
   './code-generator.js',
   './grade-mapping.js',
+  './category-system.js',
   './manifest.webmanifest',
   './firebase-config.js',
   './app-icon-192.png',

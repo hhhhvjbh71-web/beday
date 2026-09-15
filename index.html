@@ -4321,16 +4321,17 @@
         <script src="data.js?v=3" onerror="console.warn('data.js not found - fresh install mode');"></script>
         <script src="code-generator.js"></script>
         <script src="grade-mapping.js"></script>
+        <script src="category-system.js" onerror="console.warn('category-system.js not found - falling back to grade-mapping only')"></script>
         <script src="booking-groups.js?v=1"></script>
         <script src="archive_functions.js?v=5"></script>
-        <script src="app.js?v=12"></script>
+        <script src="app.js?v=14"></script>
         <script src="platform-subscriptions.js?v=4"></script>
         <script src="transfer-student.js?v=1"></script>
         <script src="receive-exams.js?v=1"></script>
         <script src="ai-exam-builder.js?v=1"></script>
-        <script src="teachers.js?v=2"></script>
+        <script src="teachers.js?v=4"></script>
         <script src="teachers-attendance.js?v=1"></script>
-        <script src="halls.js?v=2"></script>
+        <script src="halls.js?v=4"></script>
         <script src="canteen.js?v=1"></script>
         <!-- ملاحظة: تم إيقاف تحميل device-sync.js — كان يحتوي على نسخة قديمة ومختصرة
              من دوال المزامنة (رفع/استلام الطلاب والمدفوعات فقط، بدون باقي جداول
@@ -4637,50 +4638,84 @@
                     || window.navigator.standalone === true; // iOS Safari
             }
 
+            // هل سبق للمستخدم قبول التثبيت؟ (نحفظه في localStorage كـ fallback)
+            function _wasInstalledByUser() {
+                return localStorage.getItem('pwa_installed') === 'true';
+            }
+
             function _showInstallBtn() {
                 const btn = document.getElementById('pwa-install-btn');
-                if (btn && !_isRunningAsInstalledPWA()) btn.style.display = 'flex';
+                if (!btn) return;
+                if (_isRunningAsInstalledPWA() || _wasInstalledByUser()) {
+                    // التطبيق مثبت — أظهر حالة "مثبت" بدل الزر
+                    btn.innerHTML = '<i class="fas fa-check-circle"></i><span>مثبت ✅</span>';
+                    btn.style.display = 'flex';
+                    btn.style.background = 'linear-gradient(135deg, #16a34a, #15803d)';
+                    btn.style.cursor = 'default';
+                    btn.onclick = null;
+                    // أخفه بعد 3 ثواني
+                    setTimeout(() => { btn.style.display = 'none'; }, 3000);
+                } else {
+                    btn.style.display = 'flex';
+                }
             }
+
             function _hideInstallBtn() {
                 const btn = document.getElementById('pwa-install-btn');
                 if (btn) btn.style.display = 'none';
+            }
+
+            function _markAsInstalled() {
+                localStorage.setItem('pwa_installed', 'true');
+                _deferredPrompt = null;
+                _showInstallBtn(); // يظهر حالة "مثبت ✅" ثم يختفي
             }
 
             // المتصفح أعلن دعمه لإظهار مطالبة التثبيت الأصلية (Chrome/Edge/Android)
             window.addEventListener('beforeinstallprompt', (e) => {
                 e.preventDefault();
                 _deferredPrompt = e;
-                _showInstallBtn();
+                // لو سبق التثبيت — لا نُظهر الزر من جديد
+                if (!_wasInstalledByUser()) _showInstallBtn();
             });
 
             window.addEventListener('appinstalled', () => {
-                _deferredPrompt = null;
-                _hideInstallBtn();
+                _markAsInstalled();
             });
 
-            // إظهار الزر افتراضياً بمجرد جاهزية الصفحة طالما التطبيق غير مثبَّت بالفعل،
-            // حتى في المتصفحات التي لا تُطلق beforeinstallprompt (مثل Safari) — بحيث
-            // يظل الزر متاحاً دائماً ويعرض تعليمات التثبيت اليدوي عند الحاجة.
+            // إظهار الزر عند جاهزية الصفحة — مع مراعاة حالة التثبيت السابقة
             document.addEventListener('DOMContentLoaded', () => {
-                if (!_isRunningAsInstalledPWA()) _showInstallBtn();
+                if (_isRunningAsInstalledPWA()) {
+                    // يعمل كـ standalone — لا حاجة لزر التثبيت
+                    _hideInstallBtn();
+                } else if (_wasInstalledByUser()) {
+                    // سبق التثبيت — أخفِ الزر (التطبيق موجود على الجهاز)
+                    _hideInstallBtn();
+                } else {
+                    // لم يُثبَّت بعد — أظهر الزر
+                    _showInstallBtn();
+                }
             });
 
             async function triggerPWAInstall() {
                 if (_isRunningAsInstalledPWA()) {
-                    alert('التطبيق مثبت بالفعل! ✅');
-                    _hideInstallBtn();
+                    _markAsInstalled();
                     return;
                 }
 
                 if (!_deferredPrompt) {
+                    // لا يوجد prompt — عرض تعليمات يدوية
                     alert('لتثبيت التطبيق يدوياً:\n\nأندرويد Chrome: اضغط ⋮ → "إضافة إلى الشاشة الرئيسية"\nآيفون Safari: اضغط Share → "Add to Home Screen"\nكمبيوتر Chrome/Edge: اضغط أيقونة التثبيت ⊕ في شريط العنوان، أو ⋮ → "تثبيت التطبيق"');
                     return;
                 }
 
                 _deferredPrompt.prompt();
                 const { outcome } = await _deferredPrompt.userChoice;
-                _deferredPrompt = null;
-                if (outcome === 'accepted') _hideInstallBtn();
+                if (outcome === 'accepted') {
+                    _markAsInstalled(); // يحفظ في localStorage ويظهر "مثبت ✅"
+                } else {
+                    _deferredPrompt = null;
+                }
             }
 
             window.triggerPWAInstall = triggerPWAInstall;

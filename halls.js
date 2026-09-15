@@ -55,6 +55,16 @@
     const [h,m] = (t||'00:00').split(':').map(Number);
     return h*60+(m||0);
   }
+
+  // تحويل الوقت من نظام 24 ساعة إلى 12 ساعة مع صباحًا/مساءً
+  function fmt12(t){
+    if(!t) return '--:--';
+    const [h,m]=(t||'00:00').split(':').map(Number);
+    const period=h<12?'ص':'م';
+    const h12=h%12||12;
+    const mm=String(m||0).padStart(2,'0');
+    return `${h12}:${mm} ${period}`;
+  }
   function _esc(s){ return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function notify(msg, type='success') {
     if(typeof showNotification==='function') showNotification(msg, type);
@@ -120,16 +130,11 @@
   }
 
   // ── Build options ──
+  // ⚠️ اختيار المجموعة بالـ dropdown اتلغى بالكامل من مودال "إضافة حصة" —
+  // بقى حقل كتابة حرة (ls-group) بيرجع بـ GradeGroupLinkSystem.findOrCreateGroupByName
+  // وقت الحفظ. buildGradeOptions لسه مستخدمة لقائمة "الصف" بس.
   function buildGradeOptions(sel=''){
-    return (window.gradesList||[]).map(g=>
-      `<option value="${_esc(String(g.id))}" ${String(g.id)===String(sel)?'selected':''}>${_esc(g.name)}</option>`
-    ).join('');
-  }
-  function buildGroupOptions(gradeId='', selGrp=''){
-    const all=(window.db&&db.groups)||[];
-    const filtered=gradeId?all.filter(g=>String(g.grade)===String(gradeId)):all;
-    return `<option value="">-- كل المجموعات --</option>` +
-      filtered.map(g=>`<option value="${g.id}" ${String(g.id)===String(selGrp)?'selected':''}>${_esc(g.name)}</option>`).join('');
+    return window.GradeGroupLinkSystem.buildGradeOptions(sel);
   }
   function buildTeacherOptions(selT=''){
     return `<option value="">-- اختر المدرس --</option>` +
@@ -362,7 +367,11 @@
                           <i class="fas fa-plus"></i>
                         </button>
                       </div>`
-                    :byDay[dk].map(l=>_lessonMiniCard(l,color)).join('')}
+                    :byDay[dk].map(l=>_lessonMiniCard(l,color)).join('')+
+                     `<button onclick="HallsModule.openAddLessonModal('${hall.id}','${dk}')"
+                        style="width:100%;margin-top:4px;color:${color};border:1.5px dashed ${color}50;background:${color}08;border-radius:8px;padding:4px;cursor:pointer;font-size:0.7rem;font-weight:700;">
+                        <i class="fas fa-plus"></i> فترة جديدة
+                      </button>`}
                 </td>`).join('')}
             </tr>
           </tbody>
@@ -382,11 +391,16 @@
     const tName=teacherName(l.teacherId);
     const grpName=groupName(l.groupId);
     return `
-      <div style="background:${color}12;border:1.5px solid ${color}30;border-radius:9px;padding:0.45rem 0.55rem;margin-bottom:0.35rem;">
-        <div style="font-size:0.75rem;font-weight:800;color:${color};">${_esc(l.timeFrom)}–${_esc(l.timeTo)}</div>
-        <div style="font-size:0.72rem;color:var(--text-main);font-weight:700;margin-top:1px;">${_esc(tName)}</div>
+      <div style="background:${color}12;border:1.5px solid ${color}40;border-radius:11px;padding:0.55rem 0.65rem;margin-bottom:0.4rem;">
+        <!-- وقت كبير وواضح بنظام 12 ساعة -->
+        <div style="display:flex;align-items:baseline;gap:4px;margin-bottom:3px;">
+          <span style="font-size:1.05rem;font-weight:900;color:${color};line-height:1;">${fmt12(l.timeFrom)}</span>
+          <span style="font-size:0.7rem;color:${color};opacity:0.7;">→</span>
+          <span style="font-size:1.05rem;font-weight:900;color:${color};line-height:1;">${fmt12(l.timeTo)}</span>
+        </div>
+        <div style="font-size:0.72rem;color:var(--text-main);font-weight:700;margin-top:2px;">${_esc(tName)}</div>
         <div style="font-size:0.68rem;color:var(--text-muted);">${_esc(l.subject||gradeName(l.grade))} · ${_esc(grpName)}</div>
-        <div style="display:flex;gap:3px;margin-top:4px;">
+        <div style="display:flex;gap:3px;margin-top:5px;">
           <button onclick="HallsModule.openEditLessonModal('${l.id}')"
             style="flex:1;font-size:0.66rem;padding:2px 0;border:none;background:white;border-radius:5px;cursor:pointer;color:var(--primary);">
             <i class="fas fa-edit"></i>
@@ -405,11 +419,17 @@
     const grpName=groupName(l.groupId);
     const gName=gradeName(l.grade);
     return `
-      <div style="display:flex;align-items:center;gap:0.7rem;padding:0.65rem 0.85rem;background:var(--bg-light);border-radius:11px;margin-bottom:0.4rem;flex-wrap:wrap;">
-        <div style="width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0;"></div>
-        <div style="font-weight:700;color:${color};min-width:65px;font-size:0.82rem;">${_esc(dayLabel)}</div>
-        <div style="font-size:0.8rem;color:var(--text-muted);min-width:85px;"><i class="fas fa-clock" style="font-size:0.68rem;margin-left:2px;"></i>${_esc(l.timeFrom)}–${_esc(l.timeTo)}</div>
-        <div style="font-size:0.8rem;font-weight:700;flex:1;">${_esc(tName)} · ${_esc(l.subject||gName)} · ${_esc(grpName)}</div>
+      <div style="display:flex;align-items:center;gap:0.75rem;padding:0.7rem 0.9rem;background:var(--bg-light);border-radius:12px;margin-bottom:0.45rem;flex-wrap:wrap;border-right:3px solid ${color};">
+        <div style="display:flex;flex-direction:column;align-items:center;min-width:56px;">
+          <span style="font-size:0.72rem;font-weight:800;color:${color};">${_esc(dayLabel)}</span>
+        </div>
+        <!-- وقت بارز بنظام 12 ساعة -->
+        <div style="display:flex;align-items:baseline;gap:3px;min-width:140px;">
+          <span style="font-size:1rem;font-weight:900;color:${color};">${fmt12(l.timeFrom)}</span>
+          <span style="font-size:0.72rem;color:var(--text-muted);">→</span>
+          <span style="font-size:1rem;font-weight:900;color:${color};">${fmt12(l.timeTo)}</span>
+        </div>
+        <div style="font-size:0.8rem;font-weight:700;flex:1;color:var(--text-main);">${_esc(tName)} · ${_esc(l.subject||gName)} · ${_esc(grpName)}</div>
         <div style="display:flex;gap:4px;">
           <button onclick="HallsModule.openEditLessonModal('${l.id}')"
             style="padding:4px 9px;border:none;background:var(--primary);color:white;border-radius:7px;cursor:pointer;font-size:0.72rem;">
@@ -489,23 +509,29 @@
     const isToday=l.day===todayKey;
 
     return `
-      <div style="display:flex;align-items:center;gap:0.75rem;padding:0.85rem 1rem;background:var(--bg-white);
-        border-radius:13px;margin-bottom:0.45rem;box-shadow:0 1px 6px rgba(0,0,0,0.05);flex-wrap:wrap;
+      <div style="display:flex;align-items:center;gap:0.85rem;padding:0.9rem 1.1rem;background:var(--bg-white);
+        border-radius:13px;margin-bottom:0.5rem;box-shadow:0 1px 6px rgba(0,0,0,0.05);flex-wrap:wrap;
         border-right:4px solid ${color};${isToday?'border:1.5px solid '+color+';border-right:4px solid '+color+';':''}">
-        <div style="min-width:75px;">
+        <!-- اليوم -->
+        <div style="min-width:70px;">
           <span style="padding:3px 9px;border-radius:20px;font-size:0.72rem;font-weight:700;
             background:${color}20;color:${color};">${_esc(dayLabel)}</span>
-          ${isToday?'<span style="padding:2px 6px;border-radius:20px;font-size:0.65rem;font-weight:700;background:#10b981;color:white;margin-right:3px;">اليوم</span>':''}
+          ${isToday?'<div style="margin-top:3px;"><span style="padding:2px 6px;border-radius:20px;font-size:0.62rem;font-weight:700;background:#10b981;color:white;">اليوم</span></div>':''}
         </div>
-        <div style="font-size:0.82rem;font-weight:700;color:var(--text-muted);min-width:90px;">
-          <i class="fas fa-clock" style="font-size:0.7rem;margin-left:3px;"></i>${_esc(l.timeFrom)}–${_esc(l.timeTo)}
+        <!-- الوقت بارز بنظام 12 ساعة -->
+        <div style="display:flex;align-items:baseline;gap:4px;min-width:160px;">
+          <span style="font-size:1.1rem;font-weight:900;color:${color};">${fmt12(l.timeFrom)}</span>
+          <span style="font-size:0.75rem;color:var(--text-muted);">→</span>
+          <span style="font-size:1.1rem;font-weight:900;color:${color};">${fmt12(l.timeTo)}</span>
         </div>
+        <!-- المدرس والمادة -->
         <div style="flex:1;min-width:140px;">
           <div style="font-size:0.85rem;font-weight:800;color:var(--text-main);">
             <i class="fas fa-chalkboard-teacher" style="color:#4f46e5;margin-left:4px;font-size:0.78rem;"></i>${_esc(tName)}
           </div>
           <div style="font-size:0.75rem;color:var(--text-muted);">${_esc(l.subject||gName)} · ${_esc(grpName)}</div>
         </div>
+        <!-- القاعة -->
         <div style="font-size:0.8rem;font-weight:700;color:${color};">
           <i class="fas fa-door-open" style="font-size:0.72rem;margin-left:3px;"></i>${_esc(hall?hall.name:'---')}
         </div>
@@ -569,8 +595,8 @@
               <div style="display:flex;align-items:center;gap:0.75rem;padding:0.75rem;border-radius:11px;
                 background:${isNow?color+'15':'var(--bg-light)'};border:${isNow?'1.5px solid '+color:'1.5px solid transparent'};margin-bottom:0.4rem;flex-wrap:wrap;">
                 <div style="width:8px;height:8px;border-radius:50%;background:${color};flex-shrink:0;"></div>
-                <div style="font-weight:700;font-size:0.83rem;color:${color};min-width:80px;">
-                  ${l.timeFrom}–${l.timeTo}
+                <div style="font-weight:900;font-size:0.92rem;color:${color};min-width:110px;">
+                  ${fmt12(l.timeFrom)} → ${fmt12(l.timeTo)}
                   ${isNow?'<span style="background:'+color+';color:white;border-radius:10px;padding:1px 6px;font-size:0.65rem;margin-right:4px;">جارية</span>':''}
                 </div>
                 <div style="flex:1;font-size:0.82rem;">
@@ -596,7 +622,7 @@
           return `
             <div style="display:flex;align-items:center;gap:0.75rem;padding:0.65rem;border-radius:10px;background:var(--bg-light);margin-bottom:0.35rem;flex-wrap:wrap;">
               <span style="padding:2px 9px;border-radius:20px;font-size:0.72rem;font-weight:700;background:${color}20;color:${color};">${dayLabel}</span>
-              <span style="font-size:0.8rem;color:var(--text-muted);">${l.timeFrom}–${l.timeTo}</span>
+              <span style="font-size:0.85rem;font-weight:800;color:${color};">${fmt12(l.timeFrom)} → ${fmt12(l.timeTo)}</span>
               <span style="font-size:0.82rem;font-weight:700;flex:1;">${_esc(teacherName(l.teacherId))} · ${_esc(l.subject||gradeName(l.grade))}</span>
               <span style="font-size:0.78rem;color:${color};">${_esc(hall?hall.name:'---')}</span>
             </div>`;
@@ -626,8 +652,8 @@
                   ${todayH.length?` | ${todayH.length} حصة اليوم`:''}
                 </div>
                 ${todayH.map(l=>`
-                  <div style="font-size:0.72rem;margin-top:3px;color:${color};font-weight:700;">
-                    ${l.timeFrom}–${l.timeTo}: ${_esc(teacherName(l.teacherId))}
+                  <div style="font-size:0.78rem;margin-top:4px;color:${color};font-weight:800;">
+                    ${fmt12(l.timeFrom)} → ${fmt12(l.timeTo)}<span style="font-weight:600;color:var(--text-muted);font-size:0.7rem;"> · ${_esc(teacherName(l.teacherId))}</span>
                   </div>`).join('')}
               </div>`;
           }).join('')}
@@ -823,11 +849,15 @@
             </select>
           </div>
           <div>
-            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">👥 المجموعة</label>
-            <select id="ls-group" onchange="HallsModule._onLsGroupChange()"
-              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);">
-              ${buildGroupOptions(l.grade,l.groupId)}
-            </select>
+            <label style="display:block;font-size:0.84rem;font-weight:700;margin-bottom:5px;">👥 المجموعة (اكتب الاسم)</label>
+            <input id="ls-group" type="text" list="ls-group-suggestions" autocomplete="off"
+              value="${_esc((()=>{ if(!l.groupId) return ''; const g=(window.db&&db.groups||[]).find(x=>String(x.id)===String(l.groupId)); return g?g.name:''; })())}"
+              placeholder="مثال: مجموعة الأحد"
+              onchange="HallsModule._onLsGroupChange()" oninput="HallsModule._onLsGroupChange()"
+              style="width:100%;padding:0.7rem;border:1.5px solid var(--border,#e2e8f0);border-radius:10px;font-family:inherit;font-size:0.88rem;background:var(--bg-white);box-sizing:border-box;">
+            <datalist id="ls-group-suggestions">
+              ${(window.GradeGroupLinkSystem?window.GradeGroupLinkSystem.listGroupNamesForGrade(l.grade):[]).map(n=>`<option value="${_esc(n)}">`).join('')}
+            </datalist>
           </div>
         </div>
 
@@ -897,16 +927,29 @@
 
   function _onLsGradeChange(){
     const grade=document.getElementById('ls-grade')?.value||'';
-    const sel=document.getElementById('ls-group');
-    if(sel) sel.innerHTML=buildGroupOptions(grade,'');
+    const dl=document.getElementById('ls-group-suggestions');
+    if(dl){
+      const names=window.GradeGroupLinkSystem?window.GradeGroupLinkSystem.listGroupNamesForGrade(grade):[];
+      dl.innerHTML=names.map(n=>`<option value="${_esc(n)}">`).join('');
+    }
     _onLsGroupChange();
   }
   function _onLsGroupChange(){
     const hallId=document.getElementById('ls-hall')?.value||'';
-    const groupId=document.getElementById('ls-group')?.value||'';
-    if(!hallId||!groupId) return;
-    const cap=checkCapacity(hallId,groupId);
+    const grade=document.getElementById('ls-grade')?.value||'';
+    const groupName_=document.getElementById('ls-group')?.value.trim()||'';
     const warn=document.getElementById('ls-capacity-warn');
+    if(!hallId||!groupName_||!grade){ if(warn) warn.style.display='none'; return; }
+
+    // نبحث عن مجموعة موجودة فعلاً بنفس الاسم في نفس الصف — لو لسه
+    // مكتوبة جديدة (مش متعملة) مفيش لسه طلاب فيها، فمفيش داعي للتحذير.
+    const existing=(window.db&&db.groups||[]).find(g=>
+      window.GradeGroupLinkSystem.groupParentKey(g)===window.GradeGroupLinkSystem.keyOf(grade) &&
+      String(g.name||'').trim().toLowerCase()===groupName_.toLowerCase()
+    );
+    if(!existing){ if(warn) warn.style.display='none'; return; }
+
+    const cap=checkCapacity(hallId,existing.id);
     const msg=document.getElementById('ls-capacity-msg');
     if(warn&&msg){
       if(cap.over){
@@ -968,7 +1011,7 @@
     const teacherId=document.getElementById('ls-teacher')?.value||'';
     const subject=document.getElementById('ls-subject')?.value.trim()||'';
     const grade=document.getElementById('ls-grade')?.value||'';
-    const groupId=document.getElementById('ls-group')?.value||'';
+    const groupNameTyped=document.getElementById('ls-group')?.value.trim()||'';
     const day=document.getElementById('ls-day')?.value;
     const timeFrom=document.getElementById('ls-from')?.value;
     const timeTo=document.getElementById('ls-to')?.value;
@@ -978,6 +1021,15 @@
     if(!timeFrom) return notify('يرجى تحديد وقت البداية','error');
     if(!timeTo) return notify('يرجى تحديد وقت النهاية','error');
     if(toMin(timeTo)<=toMin(timeFrom)) return notify('وقت النهاية يجب أن يكون بعد وقت البداية','error');
+    if(groupNameTyped&&!grade) return notify('يرجى اختيار الصف الدراسي أولاً قبل كتابة اسم المجموعة','error');
+
+    // اسم المجموعة المكتوب يتحول لمجموعة حقيقية (موجودة بالفعل أو
+    // بتتعمل دلوقتي) قبل أي فحص تعارض/سعة، عشان الـ ID يكون جاهز.
+    let groupId=null;
+    if(groupNameTyped&&grade){
+      const grp=await window.GradeGroupLinkSystem.findOrCreateGroupByName(grade,groupNameTyped);
+      groupId=grp?grp.id:null;
+    }
 
     const errors=[];
 
@@ -1049,6 +1101,10 @@
   function ensureHallsNav(){ /* nav is in index.html */ }
 
   // ── Public API ──
+  // ملحوظة: نظام ربط الصف↔المجموعة بقى موحّد في window.GradeGroupLinkSystem
+  // (معرّف في app.js)، مش هنا. حذفنا التصدير القديم لـ gradeKey/groupGradeKey
+  // بعد ما شلنا التنفيذ المحلي بالكامل.
+
   window.HallsModule = {
     init: initHallsSection,
     ensureUI(){ ensureHallsNav(); ensureHallsSection(); },
@@ -1070,6 +1126,11 @@
     // Expose lessons for TeachersModule
     getLessons: ()=>lessons,
     getHalls: ()=>halls,
+    // يعيد تحميل بيانات القاعات/الحصص من التخزين — تستخدمها وحدة
+    // المدرسين (teachers.js) بعد حفظ/حذف جدول مدرس مباشرة في مخزن
+    // lessons، عشان تفضل بيانات هذه الوحدة متزامنة فورًا من غير ما
+    // يحتاج المستخدم يزور قسم القاعات الأول.
+    reload: async()=>{ await loadData(); },
   };
 
   document.addEventListener('DOMContentLoaded',()=>{ console.log('[halls.js] v2.0 ✅ جاهز'); });
